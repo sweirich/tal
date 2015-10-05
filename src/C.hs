@@ -37,7 +37,7 @@ data Val = TmInt Int
         | Fix (Bind (ValName, [TyName]) (Bind [(ValName, Embed Ty)] Tm))
         | TmProd [AnnVal]
         | TApp AnnVal Ty     -- new
-        | Pack Ty AnnVal Ty  -- new
+        | Pack Ty AnnVal  -- new
    deriving Show       
             
 data AnnVal = Ann Val Ty
@@ -162,8 +162,28 @@ typecheckVal g (Fix bnd) = do
 typecheckVal g (TmProd es) = do 
   tys <- mapM (typecheckAnnVal g) es
   return $ TyProd tys
-typecheckVal g (TmInt i)   = return TyInt
-  
+typecheckVal g (TmInt i)    = return TyInt
+typecheckVal g (TApp av ty) = do
+  tcty g ty
+  ty' <- typecheckAnnVal g av
+  case ty' of 
+    All bnd -> do 
+      (as, bs) <- unbind bnd
+      case as of 
+        [] -> throwE "can't instantiate non-polymorphic function"
+        (a:as') -> do
+          let bs' = subst a ty bs
+          return (All (bind as' bs'))
+
+typecheckAnnVal g (Ann (Pack ty1 av) ty) = do
+  case ty of 
+    Exists bnd -> do 
+      (a, ty2) <- unbind bnd
+      tcty g ty1
+      ty' <- typecheckAnnVal g av
+      if (not (ty' `aeq` subst a ty1 ty2)) 
+         then throwE "type error"
+         else return ty     
 typecheckAnnVal g (Ann v ty) = do  
   tcty g ty
   ty' <- typecheckVal g v 
@@ -186,7 +206,14 @@ typecheckDecl g (DeclPrim x (Embed (av1, _, av2))) = do
   case (ty1 , ty2) of 
     (TyInt, TyInt) -> return $ extendTm x TyInt g
     _ -> throwE "TypeError"
-
+typecheckDecl g (DeclUnpack a x (Embed av)) = do
+  tya <- typecheckAnnVal g av
+  case tya of 
+    Exists bnd -> do 
+      (a, ty) <- unbind bnd
+      return $ extendTy a (extendTm x ty g)
+    _ -> throwE "TypeError"
+                 
 typecheck :: Ctx -> Tm -> M ()
 typecheck g (Let bnd) = do
   (d,e) <- unbind bnd
@@ -232,6 +259,8 @@ mkSubst (DeclPrj i x (Embed (Ann (TmProd avs) _))) | i < length avs =
 mkSubst (DeclPrim  x (Embed (Ann (TmInt i1) _, p, Ann (TmInt i2) _))) = 
        let v = TmInt (evalPrim p i1 i2) in
        return $ subst x v
+mkSubst (DeclUnpack a x (Embed (Ann (Pack ty (Ann u _)) _))) = 
+  return $ subst a ty . subst x u
 mkSubst _ = throwE "invalid decl"
 
 
@@ -274,6 +303,10 @@ instance Display Ty where
       then return $ parens dt <+> text "-> void"
       else prefix "forall" (brackets da <> text "." <+> parens dt <+> text "-> void")
   display (TyProd tys) = displayTuple tys
+  display (Exists bnd) = lunbind bnd $ \ (a,ty) -> do
+    da <- display a 
+    dt <- display ty
+    prefix "exists" (da <> text "." <+> dt)
     
 instance Display (ValName,Embed Ty) where                         
   display (n, Embed ty) = do
@@ -296,6 +329,11 @@ instance Display Val where
       else prefix "\\"  (tyArgs <> tmArgs <> text "." $$ de)
     
   display (TmProd es) = displayTuple es
+  
+  display (Pack ty e) = do 
+    dty <- display ty
+    de  <- display e 
+    prefix "pack" (brackets (dty <> comma <> de))
 
 instance Display AnnVal where
   display (Ann av _) = display av  
@@ -334,3 +372,8 @@ instance Display Decl where
     d1 <- display e1 
     d2 <- display e2 
     return $ dx <+> text "=" <+> d1 <+> text str <+> d2
+  display (DeclUnpack a x (Embed av)) = do
+    da <- display a
+    dx <- display x
+    dav <- display av
+    return $ brackets (da <> comma <> dx) <+> text "=" <+> dav
