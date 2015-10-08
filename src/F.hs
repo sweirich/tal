@@ -86,6 +86,11 @@ polyid = TLam (bind a (Fix (bind (y, x, Embed (TyVar a, TyVar a)) (TmVar x))))
 polyidty :: Ty
 polyidty = All (bind a (Arr (TyVar a) (TyVar a)))
 
+
+two :: Tm
+two = App (Fix (bind (y, x, Embed (TyInt, TyInt))
+                (TmPrim (TmVar x) Plus (TmInt 1)))) (TmInt 1)
+
 -- 1 + 1
 onePlusOne :: Tm 
 onePlusOne = TmPrim (TmInt 1) Plus (TmInt 1)
@@ -100,7 +105,8 @@ sixfact = App (Fix (bind (f, n, Embed (TyInt, TyInt))
 
 -- /\a. \f:a -> a. \x:a. f (f x)
 twice = TLam (bind a 
-              (Fix (bind (y,f, Embed (Arr (TyVar a) (TyVar a), (TyVar a)))
+              (Fix (bind (y,f, Embed (Arr (TyVar a) (TyVar a), 
+                                      (Arr (TyVar a) (TyVar a))))
                     (Fix (bind (z, x, Embed (TyVar a, TyVar a))
                           (App (TmVar f) (App (TmVar f) (TmVar x))))))))
                            
@@ -155,10 +161,12 @@ typecheck g (Fix bnd) = do
   ((f, x, Embed (ty1, ty2)), e1) <- unbind bnd
   tcty g ty1
   tcty g ty2
-  ae1@(Ann _ ty2) <- typecheck (extendTm f (Arr ty1 ty2) (extendTm x ty1 g)) e1
-  return $ Ann 
-    (Fix (bind (f,x, Embed (ty1, ty2)) ae1))
-    (Arr ty1 ty2)
+  ae1@(Ann _ ty2') <- typecheck (extendTm f (Arr ty1 ty2) (extendTm x ty1 g)) e1
+  if not (ty2 `aeq` ty2')
+    then throwE $ "Type Error: Can't match " ++ pp ty2 ++ " and " ++ pp ty2'
+    else return $ Ann 
+           (Fix (bind (f,x, Embed (ty1, ty2)) ae1))
+           (Arr ty1 ty2)
 typecheck g e@(App e1 e2) = do
   ae1@(Ann _ ty1) <- typecheck g e1
   ae2@(Ann _ ty2) <- typecheck g e2
@@ -295,9 +303,10 @@ instance Display Tm where
     d2 <- display ty2
     de <- withPrec (precedence "fix") $ display e
     let arg = parens (dx <> colon <> d1)
-    if f `elem` (fv e :: [F.TmName])
-       then prefix "fix" (df <+> arg <> colon <> d2 <> text "." <+> de)
-       else prefix "\\"  (arg <> text "." <+> de)
+    --if f `elem` (fv e :: [F.TmName])
+      -- then 
+    prefix "fix" (df <+> arg <> colon <> d2 <> text "." <+> de)
+      -- else prefix "\\"  (arg <> text "." <+> de)
   display (App e1 e2) = do
     d1 <- withPrec (precedence " ") $ display e1
     d2 <- withPrec (precedence " " + 1) $ display e2

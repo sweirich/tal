@@ -1,17 +1,23 @@
 module Translate where
 
 import Unbound.LocallyNameless
-import Control.Monad.Trans.Except
+import Control.Monad.Except
+import Control.Monad.Reader
+
+import Control.Monad (liftM, liftM2, liftM3, liftM4)
 
 import Util
 import qualified F
 import qualified K
+import qualified C
 
 compile f = do
   af <- F.typecheck F.emptyCtx f 
   k  <- toProgK af
   K.typecheck K.emptyCtx k
-  return k
+  c  <- toProgC k
+  --C.typecheck C.emptyCtx c
+  return c
   
 --------------------------------------------
 -- F ==> K
@@ -31,6 +37,10 @@ toTyK (F.All bnd) = do
   let a' = translate a
   ty'    <- toTyContK ty
   return $ K.All (bind [a'][ty'])
+toTyK (F.TyProd tys) = do  
+  tys' <- mapM toTyK tys
+  return $ K.TyProd tys'
+  
 toTyContK fty = do
   kty    <- toTyK fty
   return $ K.All (bind [] [kty])
@@ -119,7 +129,7 @@ toExpK (F.Ann ftm fty) k = to ftm where
     toExpK ae body
 
     
-  to (F.Ann e ty) = throwE "found nested Ann"
+  to (F.Ann e ty) = throwError "found nested Ann"
     
 -- Turn a meta continuation into an object language continuation    
 -- Requires knowing the type of the expected value.
@@ -134,7 +144,119 @@ reifyCont k vty = do
                  (K.All (bind [][vty]))
      
 --------------------------------------------
--- 
+-- K to C
 --------------------------------------------
+  
+type N a = ReaderT C.Ctx M a
    
+toTyC :: K.Ty -> N C.Ty
+toTyC (K.TyVar v) = return $ C.TyVar (translate v)
+toTyC K.TyInt     = return $ C.TyInt
+toTyC (K.All bnd)   = do 
+  (as, tys) <- unbind bnd
+  let as' = map translate as
+  tys' <- local (C.extendTys as') $ mapM toTyC tys
+  b' <- fresh (string2Name "b")
+  let prod = C.TyProd [C.All (bind as' (C.TyVar b' : tys')), C.TyVar b']
+  return $ (C.Exists (bind b' prod))
+toTyC (K.TyProd tys) = do
+  tys' <- mapM toTyC tys
+  return $ C.TyProd tys'
+  
+toProgC :: K.Tm -> M C.Tm  
+toProgC k = runReaderT (toTmC k) C.emptyCtx
+  
+toTmC :: K.Tm -> N C.Tm
+toTmC (K.Let bnd) = do 
+  (decl, tm) <- unbind bnd
+  decl'      <- toDeclC decl
+  tm'        <- local (C.extendDecl decl') (toTmC tm)
+  return $ C.Let (bind decl' tm')
+toTmC (K.App v@(K.Ann _ t) tys vs) = do
+  -- g <- fresh $ string2Name "g"
+  z <- fresh $ string2Name "z"
+  zcode <- fresh $ string2Name "zcode"
+  zenv <- fresh $ string2Name "zenv"
+  v' <- toAnnValC v
+  t' <- toTyC t
+  tys' <- mapM toTyC tys
+  vs'  <- mapM toAnnValC vs
+  case t' of 
+    C.Exists bnd -> do 
+      (b, prodty) <- unbind bnd
+      case prodty of 
+        C.TyProd [ tcode, C.TyVar b' ] | b == b' -> do
+          let vz = C.Ann (C.TmVar z) prodty
+          let ds = [C.DeclUnpack b z (Embed v'), 
+                    C.DeclPrj 0 zcode (Embed vz),
+                    C.DeclPrj 1 zenv  (Embed vz)]
+          ann <- C.mkTyApp (C.Ann (C.TmVar zcode) tcode) tys'
+          let prd = (C.Ann (C.TmVar zenv) (C.TyVar b)):vs'
+          return $ foldr (\ b e -> C.Let (bind b e)) (C.App ann prd) ds
+        _ -> throwError "type error"
+    _ -> throwError "type error"
+toTmC (K.TmIf0 v tm1 tm2) = do    
+  liftM3 C.TmIf0 (toAnnValC v) (toTmC tm1) (toTmC tm2)
+toTmC (K.Halt ty v) =
+  liftM2 C.Halt (toTyC ty) (toAnnValC v)
     
+toDeclC :: K.Decl -> N C.Decl
+toDeclC (K.DeclVar   x (Embed v)) = do
+  v' <- toAnnValC v
+  return $ C.DeclVar (translate x) (Embed v')
+toDeclC (K.DeclPrj i x (Embed v)) = do
+  v' <- toAnnValC v
+  return $ C.DeclPrj i (translate x) (Embed v')
+toDeclC (K.DeclPrim  x (Embed (v1, p, v2))) = do
+  v1' <- toAnnValC v1
+  v2' <- toAnnValC v2
+  return $ C.DeclPrim (translate x) (Embed (v1',p, v2'))
+
+toAnnValC :: K.AnnVal -> N C.AnnVal
+toAnnValC (K.Ann (K.TmInt i) K.TyInt) = 
+  return $ C.Ann (C.TmInt i) C.TyInt
+toAnnValC (K.Ann (K.TmVar v) ty) = do
+  ty' <- toTyC ty
+  return $ C.Ann (C.TmVar (translate v)) ty'
+toAnnValC (K.Ann v@(K.Fix bnd1) t@(K.All _)) = do
+  t' <- toTyC t
+  ((f,as), bnd2)  <- unbind bnd1
+  (xtys, e)       <- unbind bnd2
+  let (xs,tys) = unzip $ map (\(x,Embed ty) -> (x,ty)) xtys
+--  (as', tys')     <- unbind bnd'
+--  let tys  = swaps (mkPerm (map AnyName as) (map AnyName as')) tys'
+  let xs'  = map translate xs
+  tys'     <- mapM toTyC tys
+  let ys   = (map translate (fv v :: [K.TmName]))
+  ctx      <- ask
+  ss'      <- lift $ mapM (C.lookupTmVar ctx) ys            
+  let as'  = map translate as
+  let bs   = (map translate (fv v :: [K.TyName]))
+  let tenv     = C.TyProd ss'
+  let trawcode = C.All (bind (bs ++ as') (tenv:tys'))
+  zvar         <- fresh $ string2Name "zfix"
+  let zcode    = C.Ann (C.TmVar zvar) trawcode
+  zenvvar      <- fresh $ string2Name "zfenv"      
+  let zenv     = C.Ann (C.TmVar zenvvar) tenv
+  tyAppZenv <- C.mkTyApp zcode (map C.TyVar bs)
+
+  let mkprj (x, i) e = 
+        C.Let (bind (C.DeclPrj i x (Embed zenv)) e)        
+  let extend = \c -> foldr (uncurry C.extendTm) c (zip xs' tys')
+  e' <- local (C.extendTm (translate f) t' . extend) $ toTmC e
+  let vcode    = C.Fix (bind (zvar, (bs ++ as'))
+                        (bind ((zenvvar, Embed tenv): 
+                               zipWith (\x ty -> (x,Embed ty)) xs' tys')
+                         (C.Let (bind (C.DeclVar (translate f)
+                                       (Embed (C.Ann (C.Pack tenv (C.mkProd [tyAppZenv, zenv]))
+                                               t')))
+                                 (foldr mkprj e' (zip ys [0..]))))))
+  let venv     = C.mkProd (zipWith (\y ty -> C.Ann (C.TmVar y) ty) ys ss')
+  tyAppVcode <- (C.mkTyApp (C.Ann vcode trawcode) (map C.TyVar bs))
+  return $
+    C.Ann (C.Pack tenv (C.mkProd [tyAppVcode, venv])) t'
+
+toAnnValC (K.Ann (K.TmProd vs) ty) = do
+  ty' <- toTyC ty
+  vs' <- mapM toAnnValC vs
+  return $ C.Ann (C.TmProd vs') ty'
