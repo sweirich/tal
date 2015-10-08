@@ -381,10 +381,10 @@ instance Display Val where
     return $ dv <+> (brackets dt)
 
 instance Display AnnVal where
-  display (Ann av@(TmVar _) ty) = do
+{-  display (Ann av ty) = do
     da <- display av
     dt <- display ty
-    return $ parens (da <> text ":" <> dt)
+    return $ parens (da <> text ":" <> dt) -}
   display (Ann av _) = display av
 
 instance Display Tm where
@@ -395,7 +395,8 @@ instance Display Tm where
     return $ da <> tmArgs
   display (Halt ty v) = do 
     dv <- display v
-    return $ text "halt" <+> dv
+    --dt <- display ty
+    return $ text "halt" <+> dv -- <+> text ":" <+> dt
   display (Let bnd) = lunbind bnd $ \(d, e) -> do
     dd <- display d
     de <- display e

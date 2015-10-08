@@ -82,6 +82,12 @@ c :: Name Ty
 polyid :: Tm
 polyid = TLam (bind a (Fix (bind (y, x, Embed (TyVar a, TyVar a)) (TmVar x))))
 
+
+-- /\a. \x:a. x
+polyconst :: Tm
+polyconst = TLam (bind a (Fix (bind (y, x, Embed (TyVar a, TyInt)) (TmInt 3))))
+
+
 -- All a. a -> a
 polyidty :: Ty
 polyidty = All (bind a (Arr (TyVar a) (TyVar a)))
@@ -102,6 +108,16 @@ sixfact = App (Fix (bind (f, n, Embed (TyInt, TyInt))
                      (TmPrim (TmVar n) Times
                       (App (TmVar f) 
                        (TmPrim (TmVar n) Minus (TmInt 1))))))) (TmInt 6)
+
+
+
+-- /\a. \f:a. \x:a. f
+ctrue :: Tm
+ctrue = TLam (bind a 
+              (Fix (bind (y,n, Embed (TyVar a, (Arr (TyVar a) (TyVar a))))
+                    (Fix (bind (z, x, Embed (TyVar a, TyVar a))
+                          (TmVar n))))))
+
 
 -- /\a. \f:a -> a. \x:a. f (f x)
 twice = TLam (bind a 

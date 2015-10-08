@@ -6,6 +6,8 @@ import Control.Monad.Reader
 
 import Control.Monad (liftM, liftM2, liftM3, liftM4)
 
+import qualified Data.List as List
+
 import Util
 import qualified F
 import qualified K
@@ -16,7 +18,7 @@ compile f = do
   k  <- toProgK af
   K.typecheck K.emptyCtx k
   c  <- toProgC k
-  --C.typecheck C.emptyCtx c
+  C.typecheck C.emptyCtx c
   return c
   
 --------------------------------------------
@@ -188,8 +190,8 @@ toTmC (K.App v@(K.Ann _ t) tys vs) = do
         C.TyProd [ tcode, C.TyVar b' ] | b == b' -> do
           let vz = C.Ann (C.TmVar z) prodty
           let ds = [C.DeclUnpack b z (Embed v'), 
-                    C.DeclPrj 0 zcode (Embed vz),
-                    C.DeclPrj 1 zenv  (Embed vz)]
+                    C.DeclPrj 1 zenv  (Embed vz),
+                    C.DeclPrj 0 zcode (Embed vz)]
           ann <- C.mkTyApp (C.Ann (C.TmVar zcode) tcode) tys'
           let prd = (C.Ann (C.TmVar zenv) (C.TyVar b)):vs'
           return $ foldr (\ b e -> C.Let (bind b e)) (C.App ann prd) ds
@@ -223,15 +225,13 @@ toAnnValC (K.Ann v@(K.Fix bnd1) t@(K.All _)) = do
   ((f,as), bnd2)  <- unbind bnd1
   (xtys, e)       <- unbind bnd2
   let (xs,tys) = unzip $ map (\(x,Embed ty) -> (x,ty)) xtys
---  (as', tys')     <- unbind bnd'
---  let tys  = swaps (mkPerm (map AnyName as) (map AnyName as')) tys'
   let xs'  = map translate xs
   tys'     <- mapM toTyC tys
-  let ys   = (map translate (fv v :: [K.TmName]))
+  let ys   = (map translate (List.nub (fv v :: [K.ValName])))
   ctx      <- ask
   ss'      <- lift $ mapM (C.lookupTmVar ctx) ys            
   let as'  = map translate as
-  let bs   = (map translate (fv v :: [K.TyName]))
+  let bs   = (map translate (List.nub (fv v :: [K.TyName])))
   let tenv     = C.TyProd ss'
   let trawcode = C.All (bind (bs ++ as') (tenv:tys'))
   zvar         <- fresh $ string2Name "zfix"

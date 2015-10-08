@@ -22,7 +22,6 @@ import Text.PrettyPrint as PP
 -- System K
 
 type TyName = Name Ty
-type TmName = Name Tm
 type ValName = Name Val
 
 data Ty = TyVar TyName
