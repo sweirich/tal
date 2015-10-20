@@ -17,6 +17,9 @@ import Control.Monad
 import Control.Monad.Except
 
 import qualified Data.List as List
+import Data.Map (Map)
+import qualified Data.Map as Map
+
 
 import Util
 import Text.PrettyPrint as PP
@@ -29,7 +32,7 @@ patUnbind p (B _ t) = openT p t
 ------------------
 
 
--- System K
+-- System C
 
 type TyName = Name Ty
 type TmName = Name Tm
@@ -46,7 +49,7 @@ data Val = TmInt Int
         | TmVar ValName
         | Fix (Bind (ValName, [TyName]) (Bind [(ValName, Embed Ty)] Tm))
         | TmProd [AnnVal]
-        | TApp AnnVal Ty     -- new
+        | TApp AnnVal Ty  -- new
         | Pack Ty AnnVal  -- new
    deriving Show       
             
@@ -65,6 +68,10 @@ data Tm = Let (Bind Decl Tm)
   | TmIf0 AnnVal Tm Tm
   | Halt  Ty AnnVal    
    deriving Show
+
+-- For H
+
+newtype Heap = Heap (Map ValName AnnVal) deriving Show
 
 $(derive [''Ty, ''Val, ''AnnVal, ''Decl, ''Tm])
 
@@ -285,7 +292,20 @@ typecheck g (Halt ty av) = do
     then throwError "type error"
     else return ()
 
+-----------------------------------------------------------------
 
+heapvalcheck g ann@(Ann (Fix bnd) _) = 
+  typecheckAnnVal g ann
+heapvalcheck g (Ann _ _) = 
+  throwError "type error: only code in heap"
+  
+hoistcheck (tm, Heap m) = do
+  let g' = 
+        Map.foldlWithKey (\ctx x (Ann _ ty) -> extendTm x ty ctx) 
+        emptyCtx m
+  mapM_ (heapvalcheck g') (Map.elems m)
+  typecheck g' tm
+  
 -----------------------------------------------------------------
 -- Small-step semantics
 -----------------------------------------------------------------
@@ -427,3 +447,24 @@ instance Display Decl where
     dx <- display x
     dav <- display av
     return $ brackets (da <> comma <> dx) <+> text "=" <+> dav
+    
+--------------------------------------------
+-- C to H  (actually C)  Hoisting
+--------------------------------------------    
+
+displayCode (Ann v ty) = display v
+
+instance Display Heap where
+  display (Heap m) = do
+    fcns <- mapM (\(d,v) -> do 
+                     dn <- display d
+                     dv <- displayCode v
+                     return (dn, dv)) (Map.toList m)
+    return $ hang (text "letrec") 2 $ 
+      vcat [ n <+> text "=" <+> dv | (n,dv) <- fcns ]
+
+instance Display (Tm, Heap) where
+  display (tm,h) = do
+    dh <- display h
+    dt <- display tm
+    return $ dh $$ text "in" <+> dt

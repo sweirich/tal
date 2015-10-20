@@ -1,25 +1,39 @@
+{-# LANGUAGE TupleSections #-}
+{-# OPTIONS -Wall -fwarn-tabs -fno-warn-type-defaults -fno-warn-orphans #-}
+
 module Translate where
 
-import Unbound.LocallyNameless
+import Unbound.LocallyNameless hiding (to)
 import Control.Monad.Except
 import Control.Monad.Reader
+import Control.Monad.Writer
+import Control.Monad.State
 
-import Control.Monad (liftM, liftM2, liftM3, liftM4)
+--import Control.Monad (liftM, liftM2, liftM3, liftM4)
 
 import qualified Data.List as List
+import Data.Map (Map)
+import qualified Data.Map as Map
+                 
 
 import Util
 import qualified F
 import qualified K
 import qualified C
+import qualified A
 
+compile :: F.Tm -> M (A.Tm, A.Heap)
 compile f = do
   af <- F.typecheck F.emptyCtx f 
   k  <- toProgK af
   K.typecheck K.emptyCtx k
   c  <- toProgC k
   C.typecheck C.emptyCtx c
-  return c
+  h <- toProgH c
+  C.hoistcheck h 
+  a <- toProgA h
+  -- A.progcheck  a
+  return a
   
 --------------------------------------------
 -- F ==> K
@@ -43,6 +57,7 @@ toTyK (F.TyProd tys) = do
   tys' <- mapM toTyK tys
   return $ K.TyProd tys'
   
+toTyContK :: F.Ty -> M K.Ty
 toTyContK fty = do
   kty    <- toTyK fty
   return $ K.All (bind [] [kty])
@@ -54,10 +69,10 @@ toTyContK fty = do
 -- the paper and produces output with no "administrative" redices.
 
 toProgK :: F.Tm -> M K.Tm
-toProgK ae@(F.Ann ftm fty) = do
+toProgK ae@(F.Ann _ fty) = do
   kty   <- toTyK fty             
   toExpK ae (\kv -> return $ K.Halt kty kv)
-
+toProgK _ = throwError "toProgK given unannotated expression!"
   
 toExpK :: F.Tm -> (K.AnnVal -> M K.Tm) -> M K.Tm
 toExpK (F.Ann ftm fty) k = to ftm where
@@ -132,7 +147,9 @@ toExpK (F.Ann ftm fty) k = to ftm where
 
     
   to (F.Ann e ty) = throwError "found nested Ann"
-    
+toExpK _ _ = throwError "toExpK: found unannotated expression"
+
+
 -- Turn a meta continuation into an object language continuation    
 -- Requires knowing the type of the expected value.
     
@@ -146,9 +163,13 @@ reifyCont k vty = do
                  (K.All (bind [][vty]))
      
 --------------------------------------------
--- K to C
+-- K to C    Closure conversion
 --------------------------------------------
   
+-- NOTE: we need to keep track of the current context
+-- so that we can find out the types of free variables
+-- (The FV function only gives us free names, not free
+-- annotated variables)
 type N a = ReaderT C.Ctx M a
    
 toTyC :: K.Ty -> N C.Ty
@@ -176,9 +197,9 @@ toTmC (K.Let bnd) = do
   return $ C.Let (bind decl' tm')
 toTmC (K.App v@(K.Ann _ t) tys vs) = do
   -- g <- fresh $ string2Name "g"
-  z <- fresh $ string2Name "z"
+  z     <- fresh $ string2Name "z"
   zcode <- fresh $ string2Name "zcode"
-  zenv <- fresh $ string2Name "zenv"
+  zenv  <- fresh $ string2Name "zenv"
   v' <- toAnnValC v
   t' <- toTyC t
   tys' <- mapM toTyC tys
@@ -260,3 +281,201 @@ toAnnValC (K.Ann (K.TmProd vs) ty) = do
   ty' <- toTyC ty
   vs' <- mapM toAnnValC vs
   return $ C.Ann (C.TmProd vs') ty'
+toAnnValC _ = throwError "toAnnValC: inconsistent annotation"
+
+--------------------------------------------
+-- C to H  (actually C)  Hoisting
+--------------------------------------------
+
+instance Monoid C.Heap where
+  mempty  = C.Heap Map.empty
+  mappend (C.Heap h1) (C.Heap h2) = C.Heap (Map.union h1 h2)
+  
+-- we keep track of the current heap as we hoist
+-- 'fix' expressions out of expressions
+type H a = StateT C.Heap (WriterT C.Heap M a)
+
+toProgH :: C.Tm -> M (C.Tm, C.Heap)
+toProgH tm = runStateT (toTmH tm) mempty
+
+toTmH :: C.Tm -> H C.Tm
+toTmH (C.Let bnd) = do 
+  (decl, tm) <- unbind bnd
+  decl'      <- toDeclH decl
+  tm'        <- toTmH tm
+  return $ C.Let (bind decl' tm')
+toTmH (C.App v vs) = do
+  v'   <- toAnnValH v
+  vs'  <- mapM toAnnValH vs
+  return $ C.App v' vs'
+toTmH (C.TmIf0 v tm1 tm2) = do    
+  liftM3 C.TmIf0 (toAnnValH v) (toTmH tm1) (toTmH tm2)
+toTmH (C.Halt ty v) =
+  liftM (C.Halt ty) (toAnnValH v)
+    
+toDeclH :: C.Decl -> H C.Decl
+toDeclH (C.DeclVar x (Embed v)) = do
+  v' <- toAnnValH v
+  return $ C.DeclVar x (Embed v')
+toDeclH (C.DeclPrj i x (Embed v)) = do
+  v' <- toAnnValH v
+  return $ C.DeclPrj i x (Embed v')
+toDeclH (C.DeclPrim  x (Embed (v1, p, v2))) = do
+  v1' <- toAnnValH v1
+  v2' <- toAnnValH v2
+  return $ C.DeclPrim x (Embed (v1',p, v2'))
+toDeclH (C.DeclUnpack g x (Embed v)) = do
+  v' <- toAnnValH v
+  return $ C.DeclUnpack g x (Embed v')
+  
+
+toAnnValH :: C.AnnVal -> H C.AnnVal
+toAnnValH (C.Ann (C.TmInt i) _) = 
+  return $ C.Ann (C.TmInt i) C.TyInt
+toAnnValH (C.Ann (C.TmVar v) ty) = do
+  return $ C.Ann (C.TmVar v) ty
+toAnnValH (C.Ann (C.Fix bnd1) ty) = do 
+  ((f, as),bnd2)  <- unbind bnd1
+  (xtys, tm)      <- unbind bnd2
+  codef           <- fresh f
+  modify (\s -> mappend s (C.Heap (Map.singleton codef v')))
+  tm'             <- toTmH tm
+  let v' = (C.Ann (C.Fix (bind (f,as) (bind xtys tm'))) ty)  
+  return (C.Ann (C.TmVar codef) ty)
+  
+toAnnValH (C.Ann (C.TmProd ps) ty) = do
+  ps' <- mapM toAnnValH ps
+  return $ C.Ann (C.TmProd ps') ty
+toAnnValH (C.Ann (C.TApp v ty1) ty) = do
+  v' <- toAnnValH v 
+  return $ C.Ann (C.TApp v' ty1) ty
+toAnnValH (C.Ann (C.Pack ty1 v) ty) = do
+  v' <- toAnnValH v
+  return $ C.Ann (C.Pack ty1 v') ty
+
+--------------------------------------------
+-- H to A  (Allocation)
+--------------------------------------------
+
+toTyA :: C.Ty -> M A.Ty
+toTyA (C.TyVar v) = return $ A.TyVar (translate v)
+toTyA C.TyInt     = return $ A.TyInt
+toTyA (C.All bnd)   = do 
+  (as, tys) <- unbind bnd
+  let as' = map translate as
+  tys' <- mapM toTyA tys
+  return (A.All (bind as' tys'))
+toTyA (C.TyProd tys) = do
+  tys' <- mapM toTyA tys
+  return $ A.TyProd $ map (,A.Init) tys'
+toTyA (C.Exists bnd) = do 
+  (a, ty) <- unbind bnd
+  let a' = translate a
+  ty' <- toTyA ty
+  return $ A.Exists (bind a' ty')
+  
+toProgA :: (C.Tm, C.Heap) -> M (A.Tm, A.Heap)
+toProgA (tm, C.Heap heap) = do
+  asc <- mapM (\(x,hv) -> liftM (translate x,) (toHeapValA hv)) 
+         (Map.assocs heap)
+  let heap' = A.Heap (Map.fromDistinctAscList asc)
+  tm' <- toExpA tm
+  return (tm', heap')
+
+toHeapValA :: C.AnnVal -> M (A.Ann A.HeapVal)
+toHeapValA (C.Ann (C.Fix bnd) _) = do 
+  ((f,as), bnd2) <- unbind bnd
+  (xtys, e)      <- unbind bnd2
+  let (xs,tys) = unzip $ map (\(x,Embed y) -> (x,y)) xtys      
+  tys' <- mapM toTyA tys
+  let as' = map translate as
+  let xs' = map translate xs
+  e' <- toExpA e
+  return (A.Ann (A.Code (bind as' (bind xs' e'))) (A.All (bind as' tys')))
+toHeapValA _ = throwError "only code in the heap"
+
+
+toExpA :: C.Tm -> M A.Tm
+toExpA (C.Let bnd)  = do 
+  (d, tm) <- unbind bnd
+  ds' <- toDeclA d
+  tm' <- toExpA tm
+  return $ A.lets ds' tm'
+toExpA (C.App av avs) = do 
+  (ds', av') <- toAnnValA av
+  dsav <- mapM toAnnValA avs
+  let (dss, avs') = unzip dsav
+  return $ A.lets (ds' ++ concat dss) (A.App av' avs')
+toExpA (C.TmIf0 av e1 e2) = do
+  (ds', av') <- toAnnValA av
+  e1' <- toExpA e1
+  e2' <- toExpA e2
+  return $ A.lets ds' (A.TmIf0 av' e1' e2') 
+toExpA (C.Halt ty av) = do
+  ty' <- toTyA ty
+  (ds', av') <- toAnnValA av
+  return (A.lets ds' (A.Halt ty' av'))
+  
+  
+toDeclA :: C.Decl -> M [A.Decl]
+toDeclA (C.DeclVar x (Embed av)) = do
+  (ds', av') <- toAnnValA av
+  return (ds' ++ [A.DeclVar (translate x) (Embed av')])
+toDeclA (C.DeclPrj i x (Embed av)) = do
+  (ds', av') <- toAnnValA av
+  return (ds' ++ [A.DeclPrj i (translate x) (Embed av')])
+toDeclA (C.DeclPrim x (Embed (av1,p,av2))) = do 
+  (ds1', av1') <- toAnnValA av1
+  (ds2', av2') <- toAnnValA av2
+  return (ds1' ++ ds1' ++ [A.DeclPrim (translate x) 
+                           (Embed (av1', p, av2'))])
+  
+toDeclA (C.DeclUnpack a x (Embed av)) = do
+  (ds', av') <- toAnnValA av
+  return (ds' ++ [A.DeclUnpack (translate a) (translate x)
+                 (Embed av')])
+    
+updateProd :: [A.Ty] -> Int -> [(A.Ty,A.Flag)]
+updateProd tys i = [ (ty, if i < j then A.Un else A.Init) | 
+                     (ty, j) <- zip tys [0..] ]
+                           
+
+toAnnValA :: C.AnnVal -> M ([A.Decl],A.Ann A.Val)
+toAnnValA (C.Ann (C.TmProd vs) (C.TyProd tys)) = do
+  dvs' <- mapM toAnnValA vs
+  let (dss', vs') = unzip dvs'
+  tys' <- mapM toTyA tys
+  y <- fresh $ string2Name "y"
+  (yn, ds') <- foldM 
+               (\ (y0, ds) (i,avi) -> do 
+                   let ay0 = A.Ann (A.TmVar y) 
+                             (A.TyProd (updateProd tys' i))
+                   y1 <- fresh $ string2Name "y"
+                   return (y1, ds ++ [A.DeclAssign y1 
+                               (Embed (ay0, i+1, avi))]))
+               (y, concat dss' ++ [A.DeclMalloc y (Embed tys')])
+               (zip [0..] vs')
+  return $ (ds', A.Ann (A.TmVar yn) (A.TyProd (map (,A.Init) tys')))
+    
+  
+toAnnValA (C.Ann v ty) = do
+  (d,v')  <- toValA v
+  ty' <- toTyA ty
+  return $ (d, A.Ann v' ty')
+
+toValA :: C.Val -> M ([A.Decl],A.Val)
+toValA (C.TmInt i) = return ([], (A.TmInt i))
+toValA (C.TmVar v) = return ([], A.TmVar (translate v))
+toValA (C.TApp av ty) = do
+  (ds', av') <- toAnnValA av
+  ty' <- toTyA ty
+  return $ (ds', A.TApp av' ty')
+toValA (C.Pack ty av) = do
+  ty' <- toTyA ty
+  (ds', av') <- toAnnValA av
+  return (ds', A.Pack ty' av')
+toValA (C.Fix _) = throwError "no fix after hoist"
+toValA (C.TmProd _) = throwError "catch in Annval"
+
+
+  
