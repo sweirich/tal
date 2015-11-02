@@ -5,6 +5,7 @@
 module Util where
 
 import Text.PrettyPrint as PP
+import Control.Applicative
 import Control.Monad.Identity
 import Control.Monad.Trans.Except
 import Control.Monad.Reader

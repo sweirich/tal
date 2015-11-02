@@ -1,5 +1,5 @@
 {-# LANGUAGE TupleSections #-}
-{-# OPTIONS -Wall -fwarn-tabs -fno-warn-type-defaults -fno-warn-orphans #-}
+{-# OPTIONS -fwarn-tabs -fno-warn-type-defaults -fno-warn-orphans #-}
 
 module Translate where
 
@@ -8,6 +8,8 @@ import Control.Monad.Except
 import Control.Monad.Reader
 import Control.Monad.Writer
 import Control.Monad.State
+
+import Data.Monoid(Monoid(..))
 
 --import Control.Monad (liftM, liftM2, liftM3, liftM4)
 
@@ -22,7 +24,7 @@ import qualified K
 import qualified C
 import qualified A
 
-compile :: F.Tm -> M (A.Tm, A.Heap)
+-- compile :: F.Tm -> M(K.Tm  -- , A.Heap)
 compile f = do
   af <- F.typecheck F.emptyCtx f 
   k  <- toProgK af
@@ -31,9 +33,12 @@ compile f = do
   C.typecheck C.emptyCtx c
   h <- toProgH c
   C.hoistcheck h 
-  a <- toProgA h
-  -- A.progcheck  a
+  a <- toProgA h 
+  A.progcheck a
   return a
+  
+printM :: (Display a) => M a -> IO ()
+printM x = putStrLn $ pp $ runM x
   
 --------------------------------------------
 -- F ==> K
@@ -293,7 +298,7 @@ instance Monoid C.Heap where
   
 -- we keep track of the current heap as we hoist
 -- 'fix' expressions out of expressions
-type H a = StateT C.Heap (WriterT C.Heap M a)
+type H a = StateT C.Heap M a
 
 toProgH :: C.Tm -> M (C.Tm, C.Heap)
 toProgH tm = runStateT (toTmH tm) mempty
@@ -338,9 +343,9 @@ toAnnValH (C.Ann (C.Fix bnd1) ty) = do
   ((f, as),bnd2)  <- unbind bnd1
   (xtys, tm)      <- unbind bnd2
   codef           <- fresh f
+  tm'             <- toTmH tm  
+  let v' = (C.Ann (C.Fix (bind (f,as) (bind xtys tm'))) ty)    
   modify (\s -> mappend s (C.Heap (Map.singleton codef v')))
-  tm'             <- toTmH tm
-  let v' = (C.Ann (C.Fix (bind (f,as) (bind xtys tm'))) ty)  
   return (C.Ann (C.TmVar codef) ty)
   
 toAnnValH (C.Ann (C.TmProd ps) ty) = do
@@ -376,23 +381,25 @@ toTyA (C.Exists bnd) = do
   
 toProgA :: (C.Tm, C.Heap) -> M (A.Tm, A.Heap)
 toProgA (tm, C.Heap heap) = do
-  asc <- mapM (\(x,hv) -> liftM (translate x,) (toHeapValA hv)) 
+  asc <- mapM (\(x,hv) -> let x' = translate x in 
+                liftM (x',) (toHeapValA x' hv))
          (Map.assocs heap)
   let heap' = A.Heap (Map.fromDistinctAscList asc)
   tm' <- toExpA tm
   return (tm', heap')
 
-toHeapValA :: C.AnnVal -> M (A.Ann A.HeapVal)
-toHeapValA (C.Ann (C.Fix bnd) _) = do 
+toHeapValA :: A.ValName -> C.AnnVal -> M (A.Ann A.HeapVal)
+toHeapValA f' (C.Ann (C.Fix bnd) _) = do 
   ((f,as), bnd2) <- unbind bnd
   (xtys, e)      <- unbind bnd2
+  let e' = swaps (single (AnyName f)(AnyName f')) e
   let (xs,tys) = unzip $ map (\(x,Embed y) -> (x,y)) xtys      
   tys' <- mapM toTyA tys
   let as' = map translate as
   let xs' = map translate xs
   e' <- toExpA e
   return (A.Ann (A.Code (bind as' (bind xs' e'))) (A.All (bind as' tys')))
-toHeapValA _ = throwError "only code in the heap"
+toHeapValA _ _ = throwError "only code in the heap"
 
 
 toExpA :: C.Tm -> M A.Tm
@@ -435,24 +442,30 @@ toDeclA (C.DeclUnpack a x (Embed av)) = do
   return (ds' ++ [A.DeclUnpack (translate a) (translate x)
                  (Embed av')])
     
+-- create the type  [ ty_0^1 ... ty_{i-1}^1 ty_i^0 ty_{i+1}^0 ...]
 updateProd :: [A.Ty] -> Int -> [(A.Ty,A.Flag)]
-updateProd tys i = [ (ty, if i < j then A.Un else A.Init) | 
+updateProd tys i = [ (ty, if j < i then A.Init else A.Un) | 
                      (ty, j) <- zip tys [0..] ]
                            
+-- combine helper function for initialization
+-- y   -- name of tuple to initialize
+--     -- typle type [ ty_0^1 ... ty_{i-1}^1 ty_i^0 ...]
+-- ds  -- current list of declarations
+-- i   -- index of the tuple to initialize
+-- avi -- value initialize y[i]
+initialize tys' (yt, ds) (i,avi) = do                    
+  y1 <- fresh $ string2Name "ya"                   
+  let ay0 = A.Ann (A.TmVar yt) (A.TyProd (updateProd tys' i))
+  return (y1, ds ++ [A.DeclAssign y1 (Embed (ay0, i, avi))])
+
 
 toAnnValA :: C.AnnVal -> M ([A.Decl],A.Ann A.Val)
 toAnnValA (C.Ann (C.TmProd vs) (C.TyProd tys)) = do
   dvs' <- mapM toAnnValA vs
   let (dss', vs') = unzip dvs'
   tys' <- mapM toTyA tys
-  y <- fresh $ string2Name "y"
-  (yn, ds') <- foldM 
-               (\ (y0, ds) (i,avi) -> do 
-                   let ay0 = A.Ann (A.TmVar y) 
-                             (A.TyProd (updateProd tys' i))
-                   y1 <- fresh $ string2Name "y"
-                   return (y1, ds ++ [A.DeclAssign y1 
-                               (Embed (ay0, i+1, avi))]))
+  y <- fresh $ string2Name "ym"
+  (yn, ds') <- foldM (initialize tys') 
                (y, concat dss' ++ [A.DeclMalloc y (Embed tys')])
                (zip [0..] vs')
   return $ (ds', A.Ann (A.TmVar yn) (A.TyProd (map (,A.Init) tys')))

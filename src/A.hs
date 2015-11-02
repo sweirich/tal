@@ -9,6 +9,8 @@
 
 module A where
 
+
+
 import Unbound.LocallyNameless hiding (prec,empty,Data,Refl,Val)
 
 import Unbound.LocallyNameless.Alpha
@@ -16,6 +18,8 @@ import Unbound.LocallyNameless.Types
 
 import Control.Monad
 import Control.Monad.Except
+
+import Data.Monoid (Monoid(..))
 
 import qualified Data.List as List
 import Data.Map (Map)
@@ -257,12 +261,12 @@ typecheckAnnVal g (Ann v ty) = do
   ty' <- typecheckVal g v 
   if (ty `aeq` ty') 
      then return ty
-     else throwError $ "wrong annotation on: " ++ pp v ++ "\nInferred: " ++ pp ty ++ "\nAnnotated: " ++ pp ty' 
+     else throwError $ "wrong annotation on: " ++ pp v ++ "\nInferred: " ++ pp ty' ++ "\nAnnotated: " ++ pp ty 
 
 typecheckDecl g (DeclVar x (Embed av)) = do
   ty <- typecheckAnnVal g av
   return $ extendTm x ty g
-typecheckDecl g (DeclPrj i x (Embed av)) = do
+typecheckDecl g (DeclPrj i x (Embed av@(Ann v _))) = do
   ty <- typecheckAnnVal g av
   case ty of 
     TyProd tys | i < length tys -> 
@@ -284,13 +288,15 @@ typecheckDecl g (DeclUnpack a x (Embed av)) = do
 typecheckDecl g (DeclMalloc x (Embed tys)) = do                
   mapM_ (tcty g) tys
   return $ extendTm x (TyProd (map (,Un) tys)) g      
-typecheckDecl g (DeclAssign x (Embed (v1, i, v2))) = do
-  ty1 <- typecheckAnnVal g v1 
-  ty2 <- typecheckAnnVal g v2
+typecheckDecl g (DeclAssign x (Embed (av1@(Ann v1 _), i, av2))) = do
+  ty1 <- typecheckAnnVal g av1 
+  ty2 <- typecheckAnnVal g av2
   case ty1 of 
     TyProd tys | i < length tys -> 
       let (xs,(ty,_):ys) = splitAt i tys in
-      return $ extendTm x (TyProd (xs ++ (ty,Init) : ys)) g
+      if ty `aeq` ty2 
+        then return $ extendTm x (TyProd (xs ++ (ty,Init) : ys)) g
+        else throwError "TypeError"
          
 typecheck :: Ctx -> Tm -> M ()
 typecheck g (Let bnd) = do
@@ -439,7 +445,7 @@ instance Display a => Display (Ann a) where
 {-  display (Ann av ty) = do
     da <- display av
     dt <- display ty
-    return $ parens (da <> text ":" <> dt) -}
+    return $ parens (da <> text ":" <> dt)  -}
   display (Ann av _) = display av
 
 instance Display Tm where

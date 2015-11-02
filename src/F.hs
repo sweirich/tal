@@ -155,6 +155,7 @@ extendTy n ctx = ctx { getDelta =  n : (getDelta ctx) }
 extendTm :: TmName -> Ty -> Ctx -> Ctx
 extendTm n ty ctx = ctx { getGamma = (n, ty) : (getGamma ctx) }
 
+-- could be replaced with fv
 tcty :: Ctx -> Ty -> M ()
 tcty g  (TyVar x) =
    checkTyVar g x
