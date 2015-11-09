@@ -12,7 +12,16 @@ import Control.Monad.Reader
 import qualified Data.Set as Set
 import qualified Data.List as List
 
-import Unbound.LocallyNameless hiding (prec,empty,Data,Refl)
+import Unbound.LocallyNameless hiding (prec,empty,Data,Refl,Val)
+import Unbound.LocallyNameless.Alpha
+import Unbound.LocallyNameless.Types
+
+------------------
+-- should move to Unbound.LocallyNameless.Ops
+patUnbind :: (Alpha p, Alpha t) => p -> Bind p t -> t
+patUnbind p (B _ t) = openT p t
+------------------
+
 
 -------------------------------------------------------------------------
 -- Primitives
