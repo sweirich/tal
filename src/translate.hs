@@ -23,6 +23,7 @@ import qualified F
 import qualified K
 import qualified C
 import qualified A
+import qualified TAL
 
 -- compile :: F.Tm -> M(K.Tm  -- , A.Heap)
 compile f = do
@@ -490,5 +491,66 @@ toValA (C.Pack ty av) = do
 toValA (C.Fix _) = throwError "no fix after hoist"
 toValA (C.TmProd _) = throwError "catch in Annval"
 
+--------------------------------------------
+-- A to TAL  (Code Generation)
+--------------------------------------------
 
+toTyTAL :: A.Ty -> M TAL.Ty
+toTyTAL (A.TyVar v) = return $ TAL.TyVar (translate v)
+toTyTAL A.TyInt     = return $ TAL.TyInt
+toTyTAL (A.All bnd)   = do 
+  (as, tys) <- unbind bnd
+  let as' = map translate as
+  tys' <- mapM toTyTAL tys
+  let gamma = Map.fromList (zip [TAL.reg0 ..] tys')
+  return (TAL.All (bind as' gamma))
+toTyTAL (A.TyProd tys) = do
+  tys' <- mapM (\(ty,f) -> liftM (,TAL.Init) (toTyTAL ty)) tys
+  return $ TAL.TyProd $ tys'
+toTyTAL (A.Exists bnd) = do 
+  (a, ty) <- unbind bnd
+  let a' = translate a
+  ty' <- toTyTAL ty
+  return $ TAL.Exists (bind a' ty')  
+
+type Varmap = Map A.ValName TAL.SmallVal
+
+toSmallVal :: Varmap -> A.Ann A.Val -> M TAL.SmallVal
+toSmallVal vm (A.Ann (A.TmInt i) _) = return $ TAL.WordVal (TAL.TmInt i)
+toSmallVal vm (A.Ann (A.TmVar x) _) = case Map.lookup x vm of 
+  Just sv -> return sv
+  Nothing -> throwError "not found"
+toSmallVal vm (A.Ann (A.TApp av ty) _)    = undefined    
+toSmallVal vm (A.Ann (A.Pack ty1 av) ty2) = undefined
+
+toWordVal :: Varmap -> A.Ann A.Val -> M TAL.WordVal
+toWordVal vm (A.Ann (A.TmInt i) _) = return $ TAL.TmInt i
+toWordVal vm (A.Ann (A.TmVar x) _) = case Map.lookup x vm of 
+  Just (TAL.WordVal wv) -> return wv
+  Just _  -> throwError "must be wordval"
+  Nothing -> throwError "not found"
+toWordVal vm (A.Ann (A.TApp av ty) _)    = undefined    
+toWordVal vm (A.Ann (A.Pack ty1 av) ty2) = undefined
+
+
+toInstrsTAL :: Varmap -> TAL.Delta -> TAL.Gamma -> A.Tm -> M (TAL.Heap, TAL.InstrSeq)
+toInstrsTAL vm delta gamma (A.Let bnd) = do 
+  (decl, tm) <- unbind bnd
+  -- (delta', gamma', heap, is) <- toDeclsTAL vm delta gamma decl
+  undefined 
+  
+toHeapVal :: Varmap -> A.Ann A.HeapVal -> M (TAL.Heap, TAL.HeapVal)        
+toHeapVal = undefined                                 
+
+toProgTAL ::  (A.Tm, A.Heap) -> M TAL.Machine
+toProgTAL (tm, A.Heap hp) = do
+  let vars   = Map.keys hp
+  let labels = map (\n -> TAL.Label (name2String n, 0)) vars
+  let vm     = Map.fromList (zip vars (map (TAL.WordVal . TAL.LabelVal) labels))
+  hhvs <- mapM (toHeapVal vm) (Map.elems hp)
+  let (heaps, hvals) = unzip hhvs
+  let hroot  = Map.fromList (zip labels hvals)
+  (hexp, is) <- toInstrsTAL vm [] Map.empty tm 
+  let heap = Map.unions (hroot : heaps ++ [hexp])
+  return (heap, Map.empty, is)
   

@@ -32,8 +32,8 @@ import Text.PrettyPrint as PP
 
 ------------------
 -- should move to Unbound.LocallyNameless.Ops
-patUnbind :: (Alpha p, Alpha t) => p -> Bind p t -> t
-patUnbind p (B _ t) = openT p t
+-- patUnbind :: (Alpha p, Alpha t) => p -> Bind p t -> t
+-- patUnbind p (B _ t) = openT p t
 ------------------
 
 

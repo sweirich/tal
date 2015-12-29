@@ -46,10 +46,19 @@ data Flag = Un | Init
 
 -- Heap types
 type Psi   = Map Label Ty  
+
 -- Register file types
 type Gamma = Map Register Ty
 
 newtype Register = Register String deriving (Eq, Ord, Show)
+
+reg0 :: Register
+reg0 = Register "r0"
+
+instance Enum Register where
+  toEnum i = Register ("r" ++ show i)
+  fromEnum (Register ('r' : str)) = read str
+
 newtype Label    = Label  (String,Int) deriving (Eq, Ord, Show)
 
 data TyApp a = TyApp a Ty    deriving Show
@@ -69,7 +78,7 @@ data SmallVal = RegVal Register
    deriving Show
             
 data HeapVal = 
-    Tuple [WordVal]
+    Tuple [WordVal] 
   | Code  [TyName] Gamma InstrSeq  -- nominal binding
     deriving Show
 
@@ -277,28 +286,17 @@ extendTy n ctx = ctx { getDelta =  n : (getDelta ctx) }
 extendTys :: [TyName] -> Ctx -> Ctx
 extendTys ns ctx = foldr extendTy ctx ns
 
-{-
-lookupTmVar :: Ctx -> ValName -> M Ty
-lookupTmVar g v = do
-    case lookup v (getGamma g) of
+lookupHeapLabel :: Ctx -> Label -> M Ty
+lookupHeapLabel ctx v = do
+    case Map.lookup v (getPsi ctx) of
       Just s -> return s
-      Nothing -> throwError $ "Term variable notFound " ++ (show v)
+      Nothing -> throwE $ "Label not found " ++ (show v)
 
-extendTm :: ValName -> Ty -> Ctx -> Ctx
-extendTm n ty ctx = ctx { getGamma = (n, ty) : (getGamma ctx) }
-
-extendTms :: [ValName] -> [Ty] -> Ctx -> Ctx
-extendTms [] [] ctx = ctx
-extendTms (n:ns) (ty:tys) ctx = extendTm n ty (extendTms ns tys ctx)
--}
-{-
-extendDecl :: Decl -> Ctx -> Ctx
-extendDecl (DeclVar x (Embed (Ann _ ty))) = extendTm x ty
-extendDecl (DeclPrj i x (Embed (Ann _ (TyProd tys)))) = extendTm x (tys !! i)                                           
-extendDecl (DeclPrim x  _) = extendTm x TyInt
-extendDecl (DeclUnpack b x (Embed (Ann _ (Exists bnd)))) = 
-  extendTy b . extendTm x (patUnbind b bnd)
--}
+lookupReg :: Ctx -> Register -> M Ty
+lookupReg ctx v = do
+    case Map.lookup v (getGamma ctx) of
+      Just s -> return s
+      Nothing -> throwE $ "Register not found " ++ (show v)
 
 -- tau is a well-formed type
 tcty :: Ctx -> Ty -> M ()
@@ -316,14 +314,17 @@ tcty ctx (Exists b) = do
   tcty (extendTy a ctx) ty
 
 -- Psi is a well-formed heap type
+-- Only uses D 
 tcPsi :: Ctx -> Psi -> M ()
 tcPsi ctx psi = mapM_ (tcty ctx) (Map.elems psi)
                                  
 -- Gamma is a well-formed register file
+-- D |- G
 tcGamma :: Ctx -> Gamma -> M ()
 tcGamma ctx g = mapM_ (tcty ctx) (Map.elems g)
 
 -- t1 is a subtype of t2
+-- D |- t1 <= t2 
 subtype :: Ctx -> Ty -> Ty -> M ()
 subtype ctx (TyVar x) (TyVar y) | x == y = return ()
 subtype ctx TyInt TyInt = return ()
@@ -331,183 +332,175 @@ subtype ctx (All bnd1) (All bnd2) = do
   Just (vs1, g1, vs2, g2) <- unbind2 bnd1 bnd2
   subGamma ctx g1 g2
   
+-- D |- G1 <= G2  
 subGamma :: Ctx -> Gamma -> Gamma -> M ()
-subGamma = undefined
-
-{-
-typecheckHeapVal :: Ctx -> Ann HeapVal -> M Ty
-typecheckHeapVal g (Ann (Code bnd) (All bnd')) = do  
-  mb  <- unbind2 bnd bnd' -- may fail
-  case mb of 
-    Just (as, bnd2, _, tys) -> do
-      (xs, e) <- unbind bnd2
-      let g' = extendTys as g
-      mapM_ (tcty g') tys
-      typecheck (extendTms xs tys g') e
-      return (All bnd')
-    Nothing -> throwError "wrong # of type variables"
+subGamma ctx g1 g2 = do
+  mapM_ (\(r, t2) -> case Map.lookup r g1 of 
+            Just t1 -> subtype ctx t1 t1 
+            Nothing -> throwE $ "register not found:" ++ show r) 
+    (Map.assocs g2)
+    
+-- |- H : Psi    
+typeCheckHeap :: Heap -> Psi -> M ()
+typeCheckHeap h psi = mapM_ tcHeapDecl (Map.assocs h) where
+  ctx = emptyCtx { getPsi = psi } 
   
-typecheckHeapVal g (Ann (Tuple es) ty) = do 
-  tys <- mapM (typecheckAnnVal g) es
-  let ty' = TyProd $ map (,Un) tys 
-  if ty `aeq` ty' 
-    then return ty
-    else throwError "incorrect annotation on tuple"
+  tcHeapDecl :: (Label, HeapVal) -> M ()
+  tcHeapDecl (l,hv) = 
+    case Map.lookup l psi of
+      Just ty -> tcHeapVal hv ty
+      Nothing -> throwE $ "heap type not found:" ++ show l
+      
+  tcTuple (Junk ty', (ty,Un)) = 
+    -- maybe we know these are the same already?
+    subtype ctx ty' ty
+  tcTuple (wv, (ty,Init)) = do
+     ty' <- tcWordVal ctx wv 
+     subtype ctx ty' ty 
+     
+  tcHeapVal (Tuple wvs) (TyProd tys) | length wvs == length tys = do
+    mapM_ tcTuple (zip wvs tys)
+            
+  tcHeapVal (Code as g is) _ = do
+    -- TODO: better error message. What if wrong # binders?
+    -- let g' = patUnbind as bnd
+    -- check (All bnd) ??
+    let ctx = Ctx as g psi
+    tcInstrSeq ctx is
+  tcHeapVal _ _ = throwE $ "wrong type for heap val"
 
-typecheckVal :: Ctx -> Val -> M Ty
-typecheckVal g (TmVar x) = lookupTmVar g x
-typecheckVal g (TmInt i)    = return TyInt
-typecheckVal g (TApp av ty) = do
-  tcty g ty
-  ty' <- typecheckAnnVal g av
+tcWordVal :: Ctx -> WordVal -> M Ty
+tcWordVal ctx (LabelVal l) = lookupHeapLabel ctx l
+tcWordVal ctx (TmInt i)    = return TyInt
+tcWordVal ctx (Junk ty')   = throwE $ "BUG: no Junk here"
+tcWordVal ctx (WApp tapp) = tcApp tcWordVal ctx tapp
+tcWordVal ctx (WPack pack) = tcPack tcWordVal ctx pack
+
+tcApp :: (Ctx -> a -> M Ty) -> Ctx -> TyApp a -> M Ty
+tcApp f ctx (TyApp wv ty) = do
+  tcty ctx ty
+  ty' <- f ctx wv
   case ty' of 
     All bnd -> do 
       (as, bs) <- unbind bnd
       case as of 
-        [] -> throwError "can't instantiate non-polymorphic function"
+        [] -> throwE "can't instantiate non-polymorphic function"
         (a:as') -> do
           let bs' = subst a ty bs
           return (All (bind as' bs'))
 
-typecheckAnnVal g (Ann (Pack ty1 av) ty) = do
+tcPack :: (Ctx -> a -> M Ty) -> Ctx -> Pack a -> M Ty 
+tcPack f ctx (Pack ty1 wv ty) = do
   case ty of 
     Exists bnd -> do 
       (a, ty2) <- unbind bnd
-      tcty g ty1
-      ty' <- typecheckAnnVal g av
+      tcty ctx ty1
+      ty' <- f ctx wv
       if (not (ty' `aeq` subst a ty1 ty2)) 
-         then throwError "type error"
-         else return ty     
-typecheckAnnVal g (Ann v ty) = do  
-  tcty g ty
-  ty' <- typecheckVal g v 
-  if (ty `aeq` ty') 
-     then return ty
-     else throwError $ "wrong annotation on: " ++ pp v ++ "\nInferred: " ++ pp ty' ++ "\nAnnotated: " ++ pp ty 
+         then throwE "type error"
+         else return ty    
+              
+tcSmallVal :: Ctx -> SmallVal -> M Ty              
+tcSmallVal ctx (RegVal r)   = lookupReg ctx r 
+tcSmallVal ctx (WordVal wv) = tcWordVal ctx wv
+tcSmallVal ctx (SApp app)   = tcApp tcSmallVal ctx app
+tcSmallVal ctx (SPack pack) = tcPack tcSmallVal ctx pack
 
-typecheckDecl g (DeclVar x (Embed av)) = do
-  ty <- typecheckAnnVal g av
-  return $ extendTm x ty g
-typecheckDecl g (DeclPrj i x (Embed av@(Ann v _))) = do
-  ty <- typecheckAnnVal g av
+tcInstrSeq :: Ctx -> InstrSeq -> M ()
+tcInstrSeq ctx (Seq i is) = do 
+  ctx' <- tcInstr ctx i
+  tcInstrSeq ctx' is
+tcInstrSeq ctx (Jump sv)  = do
+  ty <- tcSmallVal ctx sv
   case ty of 
-    TyProd tys | i < length tys -> 
-      return $ extendTm x (fst (tys !! i)) g
-    _ -> throwError "cannot project"
-typecheckDecl g (DeclPrim x (Embed (av1, _, av2))) = do
-  ty1 <- typecheckAnnVal g av1
-  ty2 <- typecheckAnnVal g av2
-  case (ty1 , ty2) of 
-    (TyInt, TyInt) -> return $ extendTm x TyInt g
-    _ -> throwError "TypeError"
-typecheckDecl g (DeclUnpack a x (Embed av)) = do
-  tya <- typecheckAnnVal g av
-  case tya of 
-    Exists bnd -> do 
-      let ty = patUnbind a bnd 
-      return $ extendTy a (extendTm x ty g)
-    _ -> throwError "TypeError"
-typecheckDecl g (DeclMalloc x (Embed tys)) = do                
-  mapM_ (tcty g) tys
-  return $ extendTm x (TyProd (map (,Un) tys)) g      
-typecheckDecl g (DeclAssign x (Embed (av1@(Ann v1 _), i, av2))) = do
-  ty1 <- typecheckAnnVal g av1 
-  ty2 <- typecheckAnnVal g av2
-  case ty1 of 
-    TyProd tys | i < length tys -> 
-      let (xs,(ty,_):ys) = splitAt i tys in
-      if ty `aeq` ty2 
-        then return $ extendTm x (TyProd (xs ++ (ty,Init) : ys)) g
-        else throwError "TypeError"
-         
-typecheck :: Ctx -> Tm -> M ()
-typecheck g (Let bnd) = do
-  (d,e) <- unbind bnd
-  g' <- typecheckDecl g d
-  typecheck g' e
-typecheck g (App av es) = do
-  ty <- typecheckAnnVal g av
-  case ty of
-   (All bnd) -> do
-     (as, argtys) <- unbind bnd
-     argtys' <- mapM (typecheckAnnVal g) es
-     if length as /= 0 
-       then throwError "must use type application"
-       else 
-         if (length argtys /= length argtys') 
-           then throwError "incorrect args"
-           else if (not (all id (zipWith aeq argtys argtys'))) then 
-              throwError "arg mismatch"
-              else return ()
-typecheck g (TmIf0 av e1 e2) = do
-  ty0 <- typecheckAnnVal g av
-  typecheck g e1
-  typecheck g e2
-  if ty0 `aeq` TyInt then 
-    return ()
-  else   
-    throwError "TypeError"
-typecheck g (Halt ty av) = do
-  ty' <- typecheckAnnVal g av
-  if (not (ty `aeq` ty'))
-    then throwError "type error"
-    else return ()
-         
-         
-progcheck (tm, Heap m) = do
-  let g = 
-        Map.foldlWithKey (\ctx x (Ann _ ty) -> extendTm x ty ctx) 
-        emptyCtx m
-  -- mapM_ (heapvalcheck g') (Map.elems m)
-  typecheck g tm
+    All bnd -> 
+      let g = patUnbind [] bnd in
+      subGamma ctx g (getGamma ctx)
+tcInstrSeq ctx (Halt ty)  = do
+  ty' <- lookupReg ctx reg0 
+  subtype ctx ty ty' 
 
+tcArith :: Ctx -> Register -> Register -> SmallVal -> M Ctx
+tcArith ctx rd rs sv = do
+      ty1 <- lookupReg ctx rs
+      ty2 <- tcSmallVal ctx sv
+      unless (ty1 `aeq` TyInt) $ throwE "source reg must be int" 
+      unless (ty2 `aeq` TyInt) $ throwE "immediate must be int"
+      let g' = Map.insert rd TyInt (getGamma ctx) 
+      return (ctx { getGamma = g' })
 
-
------------------------------------------------------------------
--- Small-step semantics
------------------------------------------------------------------
-  
-{-
-mkSubst :: Decl -> M (Tm,Heap) -> (Tm,Heap)
-mkSubst (DeclVar   x (Embed (Ann v _))) = return $ subst x v
-mkSubst (DeclPrj i x (Embed (Ann (TmProd avs) _))) | i < length avs =
-       let Ann vi _ = avs !! i in return $ subst x vi
-mkSubst (DeclPrim  x (Embed (Ann (TmInt i1) _, p, Ann (TmInt i2) _))) = 
-       let v = TmInt (evalPrim p i1 i2) in
-       return $ subst x v
-mkSubst (DeclUnpack a x (Embed (Ann (Pack ty (Ann u _)) _))) = 
-  return $ subst a ty . subst x u  
-mkSubst (DeclPrj i x (Embed av)) = 
-  throwError $ "invalid prj " ++ pp i ++ ": " ++ pp av
-mkSubst (DeclUnpack a x (Embed av)) = 
-  throwError $ "invalid unpack:" ++ pp av
-
-
-
-step :: (Tm, Heap) -> M (Tm, Heap)
-
-step (Let bnd, heap) = do
-  (d, e) <- unbind bnd
-  ss     <- mkSubst d
-  return $ ss (e, heap)
+tcInstr :: Ctx -> Instruction -> M Ctx
+tcInstr ctx i = case i of
+    (Add rd rs sv) -> tcArith ctx rd rs sv
+    (Bnz r sv) -> do 
+      ty1 <- lookupReg ctx r
+      ty2 <- tcSmallVal ctx sv
+      unless (ty1 `aeq` TyInt) $ throwE "source reg must be int" 
+      case ty2 of
+        All bnd -> do
+          let g = patUnbind [] bnd 
+          subGamma ctx (getGamma ctx) g
+          return ctx  
+        _ -> throwE "must bnz to code label"
+            
+    (Ld  rd rs i) -> do
+      ty1 <- lookupReg ctx rs
+      case ty1 of 
+        TyProd tyfs -> do
+          when (i >= length tyfs) $ throwE "Ld: index out of range"
+          let (ty,f) = tyfs !! i
+          unless (f == Init) $ throwE "Ld: load from unitialized field"
+          let g = Map.insert rd ty (getGamma ctx)
+          return $ ctx { getGamma = g } 
+        _ -> throwE $ "Ld: not a tuple"
+              
+    (Malloc rd tys) -> do 
+      let ty = TyProd (map (,Un) tys)
+      let g = Map.insert rd ty (getGamma ctx)
+      return $ ctx { getGamma = g }    
       
-step (App (Ann e1@(Fix bnd) _) avs) = do
-    ((f, as), bnd2) <- unbind bnd
-    (xtys, e) <- unbind bnd2
-    let us = map (\(Ann u _) -> u) avs
-    let xs = map fst xtys
-    return $ substs ((f,e1):(zip xs us)) e
+    (Mov rd sv) -> do
+      ty <- tcSmallVal ctx sv
+      let g = Map.insert rd ty (getGamma ctx)
+      return $ ctx { getGamma = g }    
+      
+    (Mul rd rs sv) -> tcArith ctx rd rs sv
+    
+    (St rd i rs) -> do
+      ty1 <- lookupReg ctx rd
+      ty2 <- lookupReg ctx rs
+      case ty1 of 
+        TyProd tyfs -> do
+          when (i >= length tyfs) $ throwE "St: index out of range"
+          let (before, _:after) = List.splitAt i tyfs
+          let ty = TyProd (before ++ [(ty2,Init)] ++ after)
+          let g = Map.insert rd ty (getGamma ctx)    
+          return $ ctx { getGamma = g }
+        _ -> throwE $ "St: rd not a tuple"
+              
+    (Sub rd rs sv) -> tcArith ctx rd rs sv
+    
+    (Unpack a rd sv) -> do
+      when (a `elem` getDelta ctx) $ throwE "Unpack: tyvar not fresh"
+      ty1 <- tcSmallVal ctx sv
+      case ty1 of 
+        Exists bnd -> do
+          let ty = patUnbind a bnd
+          let g = Map.insert rd ty (getGamma ctx)    
+          return $ ctx { getDelta = a : (getDelta ctx) }{ getGamma = g }
 
-step (TmIf0 (Ann (TmInt i) _) e1 e2) = if i==0 then return e1 else return e2
+         
+progcheck :: Machine -> M ()         
+progcheck (heap, regfile, is) = do
+  let getHeapTy (_,Tuple _ )    = throwE $ "only code to start"
+      getHeapTy (l,Code as g _) = return $ (l,All (bind as g))
+  psi_assocs <- mapM getHeapTy (Map.assocs heap)
+  let psi = Map.fromList psi_assocs
+  unless (Map.null regfile) $ throwE "must start with empty registers"
+  let ctx = Ctx [] Map.empty psi
+  tcPsi ctx psi
+  tcInstrSeq ctx is
 
-step _ = throwError "cannot step"
-  
-evaluate :: Tm -> M Val
-evaluate (Halt _ (Ann v _)) = return v
-evaluate e = do
-  e' <- step e
-  evaluate e'
--}  
 -----------------------------------------------------------------
 -- Pretty-printer
 -----------------------------------------------------------------
@@ -515,12 +508,12 @@ evaluate e = do
 instance Display Ty where
   display (TyVar n)     = display n
   display (TyInt)       = return $ text "Int"
-  display (All bnd) = lunbind bnd $ \ (as,tys) -> do
+  display (All bnd) = lunbind bnd $ \ (as,g) -> do
     da <- displayList as
-    dt <- displayList tys
+    dt <- display g
     if null as 
-      then return $ parens dt <+> text "-> void"
-      else prefix "forall" (brackets da <> text "." <+> parens dt <+> text "-> void")
+      then return dt 
+      else prefix "forall" (brackets da <> text "." <+> dt)
   display (TyProd tys) = displayTuple tys
   display (Exists bnd) = lunbind bnd $ \ (a,ty) -> do
     da <- display a 
@@ -533,103 +526,112 @@ instance Display (Ty, Flag) where
     let f = case fl of { Un -> "0" ; Init -> "1" }
     return $ dty <> text "^" <> text f
     
-instance Display (ValName,Embed Ty) where                         
-  display (n, Embed ty) = do
-    dn <- display n
-    dt <- display ty
-    return $ dn <> colon <> dt
-    
-instance Display Val where                         
-  display (TmInt i) = return $ int i
-  display (TmVar n) = display n
-  display (Pack ty e) = do 
+instance Display (Map Register Ty) where
+  display m = do
+    fcns <- mapM (\(r,v) -> do 
+                     dv <- display v
+                     return (r, dv)) (Map.toList m)
+    return $ braces (sep [ text (show n) 
+                           <+> text "=" <+> dv | (n,dv) <- fcns ])
+
+instance Display a => Display (Pack a) where
+  display (Pack ty e _) = do 
     dty <- display ty
     de  <- display e 
     prefix "pack" (brackets (dty <> comma <> de))
-  display (TApp av ty) = do
+
+instance Display a => Display (TyApp a) where
+  display (TyApp av ty) = do
     dv <- display av
     dt <- display ty
     return $ dv <+> (brackets dt)
 
+instance Display WordVal where                         
+  display (LabelVal l) = return $ text ( show l)
+  display (TmInt i) = return $ int i
+  display (Junk ty) = return $ text "?"
+  display (WPack p) = display p
+  display (WApp  a) = display a
+
+instance Display SmallVal where                         
+  display (RegVal r)  = return (text $ show r)
+  display (WordVal n) = display n
+  display (SPack p) = display p
+  display (SApp  a) = display a
+
+
 instance Display HeapVal where
-  display (Code bnd) = lunbind bnd $ \(as, bnd2) -> lunbind bnd2 $ \(xtys, e) -> do
+  display (Code as gamma is) = do
     ds    <- displayList as  
-    dargs <- displayList xtys
-    de    <- withPrec (precedence "code") $ display e
+    dargs <- display gamma
+    de    <- withPrec (precedence "code") $ display is
     let tyArgs = if null as then empty else brackets ds
-    let tmArgs = if null xtys then empty else parens dargs
-    prefix "code"  (tyArgs <> tmArgs <> text "." $$ de)
+    prefix "code"  (tyArgs <> dargs <> text "." $$ de)
     
   display (Tuple es) = displayTuple es
-  
 
-instance Display a => Display (Ann a) where
-{-  display (Ann av ty) = do
-    da <- display av
-    dt <- display ty
-    return $ parens (da <> text ":" <> dt)  -}
-  display (Ann av _) = display av
+dispArith str rd rs sv = do
+  dv <- display sv
+  return $ text str <+> text (show rd) 
+    <> comma <> text (show rs) <> comma <+> dv
 
-instance Display Tm where
-  display (App av args) = do
-    da    <- display av
-    dargs <- displayList args
-    let tmArgs = if null args then empty else space <> parens dargs
-    return $ da <> tmArgs
-  display (Halt ty v) = do 
-    dv <- display v
-    --dt <- display ty
-    return $ text "halt" <+> dv -- <+> text ":" <+> dt
-  display (Let bnd) = lunbind bnd $ \(d, e) -> do
-    dd <- display d
-    de <- display e
-    return $ (text "let" <+> dd <+> text "in" $$ de)
-  display (TmIf0 e0 e1 e2) = do
-    d0 <- display e0
-    d1 <- display e1
-    d2 <- display e2
-    prefix "if0" $ parens $ sep [d0 <> comma , d1 <> comma, d2]
+instance Display Instruction where
+  display i = case i of 
+    Add rd rs sv -> dispArith "add" rd rs sv
+    Bnz r sv  -> do
+                 dv <- display sv
+                 return $ text "bnz" <+> text (show r) <> comma <> dv
+      
+    (Ld  rd rs i) -> 
+      return $ text "ld" <+> text (show rd) <> comma <> text (show rs) 
+               <> brackets (int i)
+      
+    (Malloc rd tys) -> do 
+      dtys <- displayList tys
+      return $ text "malloc" <+> text (show rd) <> comma <> brackets dtys
+      
+    (Mov rd sv) -> do
+      dv <- display sv
+      return $ text "mov" <+> text (show rd) <> comma <> dv
+      
+    (Mul rd rs sv) -> dispArith "mul" rd rs sv
+    
+    (St rd i rs) -> do
+      return $ text "st" <+> text (show rd) <> brackets (int i) <> comma 
+              <> text (show rs)
+      
+    (Sub rd rs sv) -> dispArith "sub" rd rs sv
+    
+    (Unpack a rd sv) -> do
+      dv <- display sv
+      return $ text "unpack" 
+        <> brackets (text (show a) <> comma <> text (show rd))
+        <> comma <> dv
 
-instance Display Decl where
-  display (DeclVar x (Embed av)) = do
-    dx <- display x
-    dv <- display av
-    return $ dx <+> text "=" <+> dv
-  display (DeclPrj i x (Embed av)) = do
-    dx <- display x
-    dv <- display av
-    return $ dx <+> text "=" <+> text "pi" <> int i <+> dv
-  display (DeclPrim x (Embed (e1, p, e2))) = do
-    dx <- display x
-    let str = show p
-    d1 <- display e1 
-    d2 <- display e2 
-    return $ dx <+> text "=" <+> d1 <+> text str <+> d2
-  display (DeclUnpack a x (Embed av)) = do
-    da <- display a
-    dx <- display x
-    dav <- display av
-    return $ brackets (da <> comma <> dx) <+> text "=" <+> dav
-  display (DeclMalloc x (Embed tys)) = do
-    dx <- display x
-    dtys <- displayTuple tys
-    return $ dx <+> text "= malloc" <> dtys
-  display (DeclAssign x (Embed (av1, i, av2))) = do
-    dx <- display x
-    dav1 <- display av1
-    dav2 <- display av2
-    return $ dx <+> text "=" <+> dav1 <+> brackets (text (show i)) 
-      <+>  text "<-" <+> dav2
+instance Display InstrSeq where
+  display (Seq i is) = do
+    di  <- display i 
+    dis <- display is 
+    return $ di $+$ dis
+  display (Jump sv) = do 
+    ds <- display sv
+    return $ text "jmp" <+> ds
+  display (Halt _) = do 
+    return $ text "halt" 
 
-instance Display Heap where
-  display (Heap m) = do
+
+instance Display Label where
+  display l = return (text (show l))
+
+instance Display a => Display (Map Label a) where
+  display m = do
     fcns <- mapM (\(d,v) -> do 
                      dn <- display d
                      dv <- display v
                      return (dn, dv)) (Map.toList m)
-    return $ hang (text "letrec") 2 $ 
-      vcat [ n <+> text "=" <+> dv | (n,dv) <- fcns ]
-
+    return $ vcat [ n <+> text "=" <+> dv | (n,dv) <- fcns ]
+    
+{-
 instance Display (Tm, Heap) where
   display (tm,h) = do
     dh <- display h

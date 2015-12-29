@@ -18,8 +18,10 @@ import Unbound.LocallyNameless.Types
 
 ------------------
 -- should move to Unbound.LocallyNameless.Ops
+-- ? what if the pattern binds the wrong number of variables???
 patUnbind :: (Alpha p, Alpha t) => p -> Bind p t -> t
 patUnbind p (B _ t) = openT p t
+
 ------------------
 
 
