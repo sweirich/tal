@@ -27,8 +27,9 @@ import qualified C
 import qualified A
 import qualified TAL
 
--- import Debug.Trace
--- import System.IO.Unsafe
+------------------------------------
+-- The compiler pipeline, all passes
+------------------------------------
 
 compile :: F.Tm -> M TAL.Machine
 compile f = do
@@ -45,6 +46,9 @@ compile f = do
   TAL.progcheck tal
   return tal
   
+-------------------------------
+-- Helper functions for testing
+-------------------------------
 test :: F.Tm -> IO ()  
 test f = printM $ do
   tal  <- compile f 
