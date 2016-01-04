@@ -4,16 +4,11 @@
 module Translate where
 
 import Unbound.LocallyNameless hiding (to)
-import Unbound.LocallyNameless.Ops (unsafeUnbind)
+
 
 import Control.Monad.Except
 import Control.Monad.Reader
-import Control.Monad.Writer
 import Control.Monad.State
-
-import Data.Monoid(Monoid(..))
-
---import Control.Monad (liftM, liftM2, liftM3, liftM4)
 
 import qualified Data.List as List
 import Data.Map (Map)
@@ -231,7 +226,6 @@ toTmC (K.Let bnd) = do
   tm'        <- local (C.extendDecl decl') (toTmC tm)
   return $ C.Let (bind decl' tm')
 toTmC (K.App v@(K.Ann _ t) tys vs) = do
-  -- g <- fresh $ string2Name "g"
   z     <- fresh $ string2Name "z"
   zcode <- fresh $ string2Name "zcode"
   zenv  <- fresh $ string2Name "zenv"
@@ -477,16 +471,6 @@ updateProd :: [A.Ty] -> Int -> [(A.Ty,A.Flag)]
 updateProd tys i = [ (ty, if j < i then A.Init else A.Un) | 
                      (ty, j) <- zip tys [0..] ]
                            
--- combine helper function for initialization
--- y   -- name of tuple to initialize
---     -- typle type [ ty_0^1 ... ty_{i-1}^1 ty_i^0 ...]
--- ds  -- current list of declarations
--- i   -- index of the tuple to initialize
--- avi -- value initialize y[i]
-initialize tys' (yt, ds) (i,avi) = do                    
-  y1 <- fresh $ string2Name "ya"                   
-  let ay0 = A.Ann (A.TmVar yt) (A.TyProd (updateProd tys' i))
-  return (y1, ds ++ [A.DeclAssign y1 (Embed (ay0, i, avi))])
 
 
 toAnnValA :: C.AnnVal -> M ([A.Decl],A.Ann A.Val)
@@ -495,6 +479,16 @@ toAnnValA (C.Ann (C.TmProd vs) (C.TyProd tys)) = do
   let (dss', vs') = unzip dvs'
   tys' <- mapM toTyA tys
   y <- fresh $ string2Name "ym"
+  -- combine helper function for initialization
+  -- y   -- name of tuple to initialize
+  --     -- typle type [ ty_0^1 ... ty_{i-1}^1 ty_i^0 ...]
+  -- ds  -- current list of declarations
+  -- i   -- index of the tuple to initialize
+  -- avi -- value initialize y[i]
+  let initialize tys' (yt, ds) (i,avi) = do                    
+        y1 <- fresh $ string2Name "ya"                   
+        let ay0 = A.Ann (A.TmVar yt) (A.TyProd (updateProd tys' i))
+        return (y1, ds ++ [A.DeclAssign y1 (Embed (ay0, i, avi))])
   (yn, ds') <- foldM (initialize tys') 
                (y, concat dss' ++ [A.DeclMalloc y (Embed tys')])
                (zip [0..] vs')
@@ -547,7 +541,16 @@ toTyTAL (A.Exists bnd) = do
   let ty2 = TAL.Exists $ bind a' ty'
   return $ TAL.Exists (bind a' ty')  
 
+-- Keep track of the mapping between variables and registers
+-- or heap locations
 type Varmap = Map A.ValName TAL.SmallVal
+
+-- Create a register corresponding to a particular 
+-- value variable
+var2reg :: A.ValName -> M (TAL.Register, Varmap)
+var2reg x = let rd = TAL.Register ("r" ++ (name2String x) ++ show (name2Integer x)) in
+  return $ (rd,Map.singleton x (TAL.RegVal rd))
+
 
 toSmallVal :: Varmap -> A.Ann A.Val -> M (TAL.SmallVal, TAL.Ty)
 toSmallVal vm (A.Ann (A.TmInt i) _) = 
@@ -603,8 +606,7 @@ toInstrsTAL vm delta gamma (A.App av args) = do
           foldr TAL.Seq 
           (TAL.Jump (TAL.RegVal (TAL.rtmp 0)))
           ([TAL.Mov (TAL.rtmp 0) sv] ++ movs1 ++ movs2))
-          
-  
+            
 toInstrsTAL vm delta gamma (A.TmIf0 av e1 e2) = do
   (sv,_)   <- toSmallVal vm av
   (h1,is1) <- toInstrsTAL vm delta gamma e1
@@ -625,12 +627,8 @@ toInstrsTAL vm delta gamma (A.Halt ty av) = do
           (TAL.Mov TAL.reg1 sv) `TAL.Seq`
           (TAL.Halt ty'))
 
--- Create a register corresponding to a particular 
--- value variable
-var2reg :: A.ValName -> M (TAL.Register, Varmap)
-var2reg x = let rd = TAL.Register ("r" ++ (name2String x) ++ show (name2Integer x)) in
-  return $ (rd,Map.singleton x (TAL.RegVal rd))
 
+toDeclTAL :: Varmap -> TAL.Delta -> TAL.Gamma -> A.Decl -> M (Varmap, TAL.Delta, TAL.Gamma, [TAL.Instruction])
 toDeclTAL vm delta gamma (A.DeclVar x (Embed av)) = do
   (sv, ty) <- toSmallVal vm av
   (rd, vm') <- var2reg x
@@ -646,6 +644,7 @@ toDeclTAL vm delta gamma (A.DeclPrj i x (Embed av)) = do
         TAL.TyProd tyfs -> do
           when (i >= length tyfs) $ throwError "Ld: index out of range"
           return $ fst (tyfs !! i)
+        _ -> throwError "BUG: A.DeclPrj, not a product"
   return $ (Map.union vm vm', 
             delta,
             TAL.insertGamma rd ty1 gamma,
@@ -670,8 +669,9 @@ toDeclTAL vm delta gamma (A.DeclUnpack a x (Embed av)) = do
   (rd, vm') <- var2reg x
   (sv, ty1) <- toSmallVal vm av 
   let a' = translate a 
-  let ty2 = case ty1 of 
-              TAL.Exists bnd -> patUnbind a' bnd
+  ty2 <- case ty1 of 
+              TAL.Exists bnd -> return $ patUnbind a' bnd
+              _ -> throwError "BUG: Unpack, not an exists"
   return $ (Map.union vm vm', 
             a' : delta, 
             TAL.insertGamma rd ty2 gamma,  
@@ -694,6 +694,7 @@ toDeclTAL vm delta gamma (A.DeclAssign x (Embed (av1, i, av2))) = do
           when (i >= length tyfs) $ throwError "St: index out of range"
           let (before, _:after) = List.splitAt i tyfs
           return $ TAL.TyProd (before ++ [(ty2,TAL.Init)] ++ after)
+        _ -> throwError "BUG: St: not a product"
   return $ (Map.union vm vm', 
             delta, 
             TAL.insertGamma rd ty gamma, 

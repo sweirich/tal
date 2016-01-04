@@ -50,7 +50,6 @@ evalPrim Minus = (-)
 -- Monad for evaluation, typechecking and translation.
 -------------------------------------------------------------------------
 
-
 type M = ExceptT String FreshM
 
 runM :: M a -> a
