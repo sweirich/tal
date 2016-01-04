@@ -4,6 +4,8 @@
 module Translate where
 
 import Unbound.LocallyNameless hiding (to)
+import Unbound.LocallyNameless.Ops (unsafeUnbind)
+
 import Control.Monad.Except
 import Control.Monad.Reader
 import Control.Monad.Writer
@@ -25,7 +27,10 @@ import qualified C
 import qualified A
 import qualified TAL
 
--- compile :: F.Tm -> M(K.Tm  -- , A.Heap)
+-- import Debug.Trace
+-- import System.IO.Unsafe
+
+compile :: F.Tm -> M TAL.Machine
 compile f = do
   af <- F.typecheck F.emptyCtx f 
   k  <- toProgK af
@@ -36,10 +41,30 @@ compile f = do
   C.hoistcheck h 
   a <- toProgA h 
   A.progcheck a
-  return a
+  tal <- toProgTAL a
+  TAL.progcheck tal
+  return tal
+  
+test :: F.Tm -> IO ()  
+test f = printM $ do
+  tal  <- compile f 
+  (h, r, _) <- TAL.run tal
+  case Map.lookup TAL.reg1 r of 
+    Just v -> return v
+    Nothing -> throwError "no result!"
   
 printM :: (Display a) => M a -> IO ()
 printM x = putStrLn $ pp $ runM x
+
+t1 = printM $ compile F.onePlusOne
+
+t2 = printM $ compile F.two
+
+t3 = printM $ compile F.ctrue
+
+t4 = printM $ compile F.sixfact
+
+t5 = printM $ compile F.twice
   
 --------------------------------------------
 -- F ==> K
@@ -393,13 +418,13 @@ toHeapValA :: A.ValName -> C.AnnVal -> M (A.Ann A.HeapVal)
 toHeapValA f' (C.Ann (C.Fix bnd) _) = do 
   ((f,as), bnd2) <- unbind bnd
   (xtys, e)      <- unbind bnd2
-  let e' = swaps (single (AnyName f)(AnyName f')) e
+  let e' = swaps (single (AnyName f')(AnyName f)) e
   let (xs,tys) = unzip $ map (\(x,Embed y) -> (x,y)) xtys      
   tys' <- mapM toTyA tys
   let as' = map translate as
   let xs' = map translate xs
-  e' <- toExpA e
-  return (A.Ann (A.Code (bind as' (bind xs' e'))) (A.All (bind as' tys')))
+  e'' <- toExpA e'
+  return (A.Ann (A.Code (bind as' (bind xs' e''))) (A.All (bind as' tys')))
 toHeapValA _ _ = throwError "only code in the heap"
 
 
@@ -495,6 +520,10 @@ toValA (C.TmProd _) = throwError "catch in Annval"
 -- A to TAL  (Code Generation)
 --------------------------------------------
 
+toFlag :: A.Flag -> TAL.Flag
+toFlag A.Init = TAL.Init
+toFlag A.Un   = TAL.Un
+
 toTyTAL :: A.Ty -> M TAL.Ty
 toTyTAL (A.TyVar v) = return $ TAL.TyVar (translate v)
 toTyTAL A.TyInt     = return $ TAL.TyInt
@@ -502,26 +531,38 @@ toTyTAL (A.All bnd)   = do
   (as, tys) <- unbind bnd
   let as' = map translate as
   tys' <- mapM toTyTAL tys
-  let gamma = Map.fromList (zip [TAL.reg0 ..] tys')
+  let gamma = (zip [TAL.reg1 ..] tys')
   return (TAL.All (bind as' gamma))
 toTyTAL (A.TyProd tys) = do
-  tys' <- mapM (\(ty,f) -> liftM (,TAL.Init) (toTyTAL ty)) tys
+  tys' <- mapM (\(ty,f) -> liftM (,toFlag f) (toTyTAL ty)) tys
   return $ TAL.TyProd $ tys'
 toTyTAL (A.Exists bnd) = do 
   (a, ty) <- unbind bnd
   let a' = translate a
   ty' <- toTyTAL ty
+  let ty2 = TAL.Exists $ bind a' ty'
   return $ TAL.Exists (bind a' ty')  
 
 type Varmap = Map A.ValName TAL.SmallVal
 
-toSmallVal :: Varmap -> A.Ann A.Val -> M TAL.SmallVal
-toSmallVal vm (A.Ann (A.TmInt i) _) = return $ TAL.WordVal (TAL.TmInt i)
-toSmallVal vm (A.Ann (A.TmVar x) _) = case Map.lookup x vm of 
-  Just sv -> return sv
-  Nothing -> throwError "not found"
-toSmallVal vm (A.Ann (A.TApp av ty) _)    = undefined    
-toSmallVal vm (A.Ann (A.Pack ty1 av) ty2) = undefined
+toSmallVal :: Varmap -> A.Ann A.Val -> M (TAL.SmallVal, TAL.Ty)
+toSmallVal vm (A.Ann (A.TmInt i) _) = 
+  return (TAL.WordVal (TAL.TmInt i), TAL.TyInt)
+toSmallVal vm (A.Ann (A.TmVar x) ty) = do
+  ty' <- toTyTAL ty
+  case Map.lookup x vm of 
+    Just sv -> return (sv, ty')
+    Nothing -> throwError $ show x ++ " not found"
+toSmallVal vm (A.Ann (A.TApp av ty) ty1)    = do
+  ty1' <- toTyTAL ty1
+  ty' <- toTyTAL ty
+  (sv',_) <- toSmallVal vm av        
+  return $ (TAL.SApp (TAL.TyApp sv' ty'), ty1')
+toSmallVal vm (A.Ann (A.Pack ty1 av) ty2) = do
+  ty1' <- toTyTAL ty1
+  (av', _)  <- toSmallVal vm av
+  ty2' <- toTyTAL ty2
+  return $ (TAL.SPack (TAL.Pack ty1' av' ty2'), ty2')
 
 toWordVal :: Varmap -> A.Ann A.Val -> M TAL.WordVal
 toWordVal vm (A.Ann (A.TmInt i) _) = return $ TAL.TmInt i
@@ -529,28 +570,165 @@ toWordVal vm (A.Ann (A.TmVar x) _) = case Map.lookup x vm of
   Just (TAL.WordVal wv) -> return wv
   Just _  -> throwError "must be wordval"
   Nothing -> throwError "not found"
-toWordVal vm (A.Ann (A.TApp av ty) _)    = undefined    
-toWordVal vm (A.Ann (A.Pack ty1 av) ty2) = undefined
+toWordVal vm (A.Ann (A.TApp av ty) _)    = do
+  ty' <- toTyTAL ty
+  sv' <- toWordVal vm av        
+  return $ TAL.WApp (TAL.TyApp sv' ty')     
+toWordVal vm (A.Ann (A.Pack ty1 av) ty2) = do
+  ty1' <- toTyTAL ty1
+  av'  <- toWordVal vm av
+  ty2' <- toTyTAL ty2
+  return $ TAL.WPack (TAL.Pack ty1' av' ty2')
 
 
-toInstrsTAL :: Varmap -> TAL.Delta -> TAL.Gamma -> A.Tm -> M (TAL.Heap, TAL.InstrSeq)
+toInstrsTAL :: Varmap -> TAL.Delta -> TAL.Gamma -> A.Tm 
+               -> M (TAL.Heap, TAL.InstrSeq)
 toInstrsTAL vm delta gamma (A.Let bnd) = do 
   (decl, tm) <- unbind bnd
-  -- (delta', gamma', heap, is) <- toDeclsTAL vm delta gamma decl
-  undefined 
+  (vm', delta', gamma', is) <- toDeclTAL vm delta gamma decl
+  (heap, is') <- toInstrsTAL vm' delta' gamma' tm
+  return (heap, foldr TAL.Seq is' is)
+toInstrsTAL vm delta gamma (A.App av args) = do
+  (sv, _) <- toSmallVal vm av
+  (svs,_) <- liftM unzip $ mapM (toSmallVal vm) args
+  let rtmps = map (\ (i,_) -> TAL.rtmp i) (zip [1 ..] svs)
+  let movs1 = zipWith TAL.Mov rtmps svs
+  let movs2 = zipWith TAL.Mov [TAL.reg1 ..] 
+              (map TAL.RegVal rtmps)
+  return (Map.empty, 
+          foldr TAL.Seq 
+          (TAL.Jump (TAL.RegVal (TAL.rtmp 0)))
+          ([TAL.Mov (TAL.rtmp 0) sv] ++ movs1 ++ movs2))
+          
   
+toInstrsTAL vm delta gamma (A.TmIf0 av e1 e2) = do
+  (sv,_)   <- toSmallVal vm av
+  (h1,is1) <- toInstrsTAL vm delta gamma e1
+  (h2,is2) <- toInstrsTAL vm delta gamma e2 
+  l        <- liftM TAL.Label (fresh (string2Name "l"))
+  let h = Map.singleton l (TAL.Code (map translate delta) gamma is2)
+  return (Map.unions [h1,h2, h],
+          (TAL.Mov (TAL.rtmp 0) sv) `TAL.Seq`
+          (TAL.Bnz (TAL.rtmp 0) 
+            (TAL.sapps (TAL.WordVal (TAL.LabelVal l)) 
+                       (map TAL.TyVar delta)) `TAL.Seq`
+          is1))
+    
+toInstrsTAL vm delta gamma (A.Halt ty av) = do 
+  (sv,_)  <- toSmallVal vm av
+  ty' <- toTyTAL ty
+  return (Map.empty, 
+          (TAL.Mov TAL.reg1 sv) `TAL.Seq`
+          (TAL.Halt ty'))
+
+-- Create a register corresponding to a particular 
+-- value variable
+var2reg :: A.ValName -> M (TAL.Register, Varmap)
+var2reg x = let rd = TAL.Register ("r" ++ (name2String x) ++ show (name2Integer x)) in
+  return $ (rd,Map.singleton x (TAL.RegVal rd))
+
+toDeclTAL vm delta gamma (A.DeclVar x (Embed av)) = do
+  (sv, ty) <- toSmallVal vm av
+  (rd, vm') <- var2reg x
+  return $ (Map.union vm vm',
+            delta, 
+            TAL.insertGamma rd ty gamma, 
+            [TAL.Mov rd sv])
+
+toDeclTAL vm delta gamma (A.DeclPrj i x (Embed av)) = do
+  (rd, vm') <- var2reg x
+  (sv, ty) <- toSmallVal vm av
+  ty1 <- case ty of 
+        TAL.TyProd tyfs -> do
+          when (i >= length tyfs) $ throwError "Ld: index out of range"
+          return $ fst (tyfs !! i)
+  return $ (Map.union vm vm', 
+            delta,
+            TAL.insertGamma rd ty1 gamma,
+            [TAL.Mov rd sv,
+             TAL.Ld rd rd i])
+  
+toDeclTAL vm delta gamma (A.DeclPrim x (Embed (av1,p,av2))) = do
+  (rd, vm') <- var2reg x 
+  (sv1, ty1) <- toSmallVal vm av1
+  (sv2, ty2) <- toSmallVal vm av2
+  let arith = case p of
+                   Plus -> TAL.Add
+                   Times -> TAL.Mul
+                   Minus -> TAL.Sub
+  return $ (Map.union vm vm', 
+            delta,
+            TAL.insertGamma rd TAL.TyInt gamma,
+            [TAL.Mov rd sv1, arith rd rd sv2])
+  
+  
+toDeclTAL vm delta gamma (A.DeclUnpack a x (Embed av)) = do
+  (rd, vm') <- var2reg x
+  (sv, ty1) <- toSmallVal vm av 
+  let a' = translate a 
+  let ty2 = case ty1 of 
+              TAL.Exists bnd -> patUnbind a' bnd
+  return $ (Map.union vm vm', 
+            a' : delta, 
+            TAL.insertGamma rd ty2 gamma,  
+            [TAL.Unpack a' rd sv])
+  
+toDeclTAL vm delta gamma (A.DeclMalloc x (Embed tys)) = do
+  (rd, vm') <- var2reg x
+  tys' <- mapM toTyTAL tys
+  return $ (Map.union vm vm', 
+            delta, 
+            TAL.insertGamma rd (TAL.TyProd (map (,TAL.Un) tys')) gamma, 
+            [TAL.Malloc rd tys']) 
+    
+toDeclTAL vm delta gamma (A.DeclAssign x (Embed (av1, i, av2))) = do
+  (rd, vm') <- var2reg x
+  (sv1, ty1) <- toSmallVal vm av1
+  (sv2, ty2) <- toSmallVal vm av2
+  ty <- case ty1 of 
+        TAL.TyProd tyfs -> do
+          when (i >= length tyfs) $ throwError "St: index out of range"
+          let (before, _:after) = List.splitAt i tyfs
+          return $ TAL.TyProd (before ++ [(ty2,TAL.Init)] ++ after)
+  return $ (Map.union vm vm', 
+            delta, 
+            TAL.insertGamma rd ty gamma, 
+            [TAL.Mov rd sv1, 
+             TAL.Mov (TAL.rtmp 0) sv2, 
+             TAL.St rd i (TAL.rtmp 0)])
+                                                      
 toHeapVal :: Varmap -> A.Ann A.HeapVal -> M (TAL.Heap, TAL.HeapVal)        
-toHeapVal = undefined                                 
+toHeapVal vm (A.Ann (A.Code bnd)  (A.All bnd')) = do
+  mb  <- unbind2 bnd bnd' -- may fail
+  case mb of 
+    Just (as, bnd2, _, tys) -> do
+      (xs, e) <- unbind bnd2
+      tys' <- mapM toTyTAL tys
+      let rs = [TAL.reg1 ..]
+      let gamma = (zip rs tys')
+      let vm' = Map.union vm (Map.fromList (zip xs (map TAL.RegVal rs)))
+      let as' = map translate as
+      (h, is) <- toInstrsTAL vm' as' gamma e
+      return (h, TAL.Code as' gamma is)
+    Nothing -> throwError "BUG!"
+                                                  
+toHeapVal vm (A.Ann (A.Tuple avs) (A.TyProd tyfs)) = do
+  wvs <- mapM (toWordVal vm) avs
+  return (Map.empty, TAL.Tuple wvs)
+          
+toHeapVal vm _  = throwError "wrong type for heap val"
+
 
 toProgTAL ::  (A.Tm, A.Heap) -> M TAL.Machine
 toProgTAL (tm, A.Heap hp) = do
   let vars   = Map.keys hp
-  let labels = map (\n -> TAL.Label (name2String n, 0)) vars
-  let vm     = Map.fromList (zip vars (map (TAL.WordVal . TAL.LabelVal) labels))
+  let labels = map (\n -> TAL.Label (translate n)) vars
+  let vm     = 
+        Map.fromList (zip vars (map (TAL.WordVal . TAL.LabelVal) labels))
   hhvs <- mapM (toHeapVal vm) (Map.elems hp)
   let (heaps, hvals) = unzip hhvs
   let hroot  = Map.fromList (zip labels hvals)
-  (hexp, is) <- toInstrsTAL vm [] Map.empty tm 
+  (hexp, is) <- toInstrsTAL vm [] [] tm 
   let heap = Map.unions (hroot : heaps ++ [hexp])
   return (heap, Map.empty, is)
   

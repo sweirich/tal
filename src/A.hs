@@ -336,7 +336,7 @@ progcheck (tm, Heap m) = do
   let g = 
         Map.foldlWithKey (\ctx x (Ann _ ty) -> extendTm x ty ctx) 
         emptyCtx m
-  -- mapM_ (heapvalcheck g') (Map.elems m)
+  mapM_ (typecheckHeapVal g) (Map.elems m)
   typecheck g tm
 
 
