@@ -5,11 +5,11 @@ name:                tal
 version:             0.1.0.0
 synopsis:            An implementation of Typed Assembly Language (Morrisett, Walker, Crary, Glew)
 -- description:
-homepage:            https://github.com/jmitchell/tal
+homepage:            https://github.com/sweirich/tal
 license:             MIT
 license-file:        LICENSE
 author:              Stephanie Weirich
-maintainer:          jmitchell@member.fsf.org
+maintainer:          sweirich@cis.upenn.edu
 copyright:           2015 Stephanie Weirich
 category:            Language
 build-type:          Simple
