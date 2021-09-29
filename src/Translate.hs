@@ -1,10 +1,7 @@
-{-# LANGUAGE TupleSections #-}
-{-# OPTIONS -fwarn-tabs -fno-warn-type-defaults -fno-warn-orphans #-}
 
 module Translate where
 
-import Unbound.LocallyNameless hiding (to)
-
+import Unbound.Generics.LocallyNameless hiding (to)
 
 import Control.Monad.Except
 import Control.Monad.Reader
@@ -13,7 +10,8 @@ import Control.Monad.State
 import qualified Data.List as List
 import Data.Map (Map)
 import qualified Data.Map as Map
-
+import Unbound.Generics.LocallyNameless.Internal.Fold (toListOf)
+import Unbound.Generics.PermM ( single )
 
 import Util
 import qualified F
@@ -41,29 +39,6 @@ compile f = do
   TAL.progcheck tal
   return tal
 
--------------------------------
--- Helper functions for testing
--------------------------------
-test :: F.Tm -> IO ()
-test f = printM $ do
-  tal  <- compile f
-  (h, r, _) <- TAL.run tal
-  case Map.lookup TAL.reg1 r of
-    Just v -> return v
-    Nothing -> throwError "no result!"
-
-printM :: (Display a) => M a -> IO ()
-printM x = putStrLn $ pp $ runM x
-
-t1 = printM $ compile F.onePlusOne
-
-t2 = printM $ compile F.two
-
-t3 = printM $ compile F.ctrue
-
-t4 = printM $ compile F.sixfact
-
-t5 = printM $ compile F.twice
 
 --------------------------------------------
 -- F ==> K
@@ -71,9 +46,13 @@ t5 = printM $ compile F.twice
 
 -- type translation
 
+translate :: Name a -> Name b
+translate n = s2n (s ++ show i) where 
+  (s,i) = (name2String n, name2Integer n)
+
 toTyK :: F.Ty -> M K.Ty
 toTyK (F.TyVar n) = return $ K.TyVar (translate n)
-toTyK F.TyInt     = return $ K.TyInt
+toTyK F.TyInt     = return K.TyInt
 toTyK (F.Arr t1 t2) = do
   k1     <- toTyK t1
   k2     <- toTyContK t2
@@ -101,7 +80,7 @@ toTyContK fty = do
 toProgK :: F.Tm -> M K.Tm
 toProgK ae@(F.Ann _ fty) = do
   kty   <- toTyK fty
-  toExpK ae (\kv -> return $ K.Halt kty kv)
+  toExpK ae (return . K.Halt kty)
 toProgK _ = throwError "toProgK given unannotated expression!"
 
 toExpK :: F.Tm -> (K.AnnVal -> M K.Tm) -> M K.Tm
@@ -129,14 +108,14 @@ toExpK (F.Ann ftm fty) k = to ftm where
     let body v1 v2 = do
           kv <- reifyCont k kty
           return (K.App v1 [] [v2, kv])
-    toExpK ae1 (\v1 -> toExpK ae2 (\v2 -> body v1 v2))
+    toExpK ae1 (toExpK ae2 . body)
 
   to (F.TmPrim ae1 p ae2) = do
     y <- fresh (string2Name "y")
     let body v1 v2 = do
           tm <- k (K.Ann (K.TmVar y) K.TyInt)
           return (K.Let (bind (K.DeclPrim y (Embed (v1,p, v2))) tm))
-    toExpK ae1 (\ x1 -> toExpK ae2 (body x1))
+    toExpK ae1 (toExpK ae2 . body)
 
   to (F.TmIf0 ae0 ae1 ae2) = do
     e1 <- toExpK ae1 k
@@ -158,15 +137,17 @@ toExpK (F.Ann ftm fty) k = to ftm where
                   return (K.Let (bind (K.DeclPrj i y (Embed v1)) tm)))
 
   to (F.TLam bnd) = do
-      (a,e@(F.Ann _ ty)) <- unbind bnd
-      kcty <- toTyContK ty
-      kvar <- fresh (string2Name "k")
-      ke   <- toExpK e (\v -> return $ K.App (K.Ann (K.TmVar kvar) kcty) [] [v])
-      f    <- fresh (string2Name "f")
-      let kfix  = K.Fix (bind (f, [translate a])
-                         (bind [(kvar, Embed kcty)] ke))
-      k (K.Ann kfix (K.All (bind [translate a] [kcty])))
-
+      (a,e) <- unbind bnd
+      case e of 
+        F.Ann _ ty -> do
+          kcty <- toTyContK ty
+          kvar <- fresh (string2Name "k")
+          ke   <- toExpK e (\v -> return $ K.App (K.Ann (K.TmVar kvar) kcty) [] [v])
+          f    <- fresh (string2Name "f")
+          let kfix  = K.Fix (bind (f, [translate a])
+                            (bind [(kvar, Embed kcty)] ke))
+          k (K.Ann kfix (K.All (bind [translate a] [kcty])))
+        _ -> throwError "toExpK: need annotation"
   to (F.TApp ae ty) = do
     aty  <- toTyK ty
     let body v1 = do
@@ -204,14 +185,14 @@ type N a = ReaderT C.Ctx M a
 
 toTyC :: K.Ty -> N C.Ty
 toTyC (K.TyVar v) = return $ C.TyVar (translate v)
-toTyC K.TyInt     = return $ C.TyInt
+toTyC K.TyInt     = return C.TyInt
 toTyC (K.All bnd)   = do
   (as, tys) <- unbind bnd
   let as' = map translate as
   tys' <- local (C.extendTys as') $ mapM toTyC tys
   b' <- fresh (string2Name "b")
   let prod = C.TyProd [C.All (bind as' (C.TyVar b' : tys')), C.TyVar b']
-  return $ (C.Exists (bind b' prod))
+  return (C.Exists (bind b' prod))
 toTyC (K.TyProd tys) = do
   tys' <- mapM toTyC tys
   return $ C.TyProd tys'
@@ -243,7 +224,7 @@ toTmC (K.App v@(K.Ann _ t) tys vs) = do
                     C.DeclPrj 1 zenv  (Embed vz),
                     C.DeclPrj 0 zcode (Embed vz)]
           ann <- C.mkTyApp (C.Ann (C.TmVar zcode) tcode) tys'
-          let prd = (C.Ann (C.TmVar zenv) (C.TyVar b)):vs'
+          let prd = C.Ann (C.TmVar zenv) (C.TyVar b):vs'
           return $ foldr (\ b e -> C.Let (bind b e)) (C.App ann prd) ds
         _ -> throwError "type error"
     _ -> throwError "type error"
@@ -277,11 +258,11 @@ toAnnValC (K.Ann v@(K.Fix bnd1) t@(K.All _)) = do
   let (xs,tys) = unzip $ map (\(x,Embed ty) -> (x,ty)) xtys
   let xs'  = map translate xs
   tys'     <- mapM toTyC tys
-  let ys   = (map translate (List.nub (fv v :: [K.ValName])))
+  let ys   = map translate (List.nub (toListOf fv v :: [K.ValName]))
   ctx      <- ask
   ss'      <- lift $ mapM (C.lookupTmVar ctx) ys
   let as'  = map translate as
-  let bs   = (map translate (List.nub (fv v :: [K.TyName])))
+  let bs   = map translate (List.nub (toListOf fv v :: [K.TyName]))
   let tenv     = C.TyProd ss'
   let trawcode = C.All (bind (bs ++ as') (tenv:tys'))
   zvar         <- fresh $ string2Name "zfix"
@@ -294,15 +275,15 @@ toAnnValC (K.Ann v@(K.Fix bnd1) t@(K.All _)) = do
         C.Let (bind (C.DeclPrj i x (Embed zenv)) e)
   let extend = \c -> foldr (uncurry C.extendTm) c (zip xs' tys')
   e' <- local (C.extendTm (translate f) t' . extend) $ toTmC e
-  let vcode    = C.Fix (bind (zvar, (bs ++ as'))
+  let vcode    = C.Fix (bind (zvar, bs ++ as')
                         (bind ((zenvvar, Embed tenv):
                                zipWith (\x ty -> (x,Embed ty)) xs' tys')
                          (C.Let (bind (C.DeclVar (translate f)
                                        (Embed (C.Ann (C.Pack tenv (C.mkProd [tyAppZenv, zenv]))
                                                t')))
                                  (foldr mkprj e' (zip ys [0..]))))))
-  let venv     = C.mkProd (zipWith (\y ty -> C.Ann (C.TmVar y) ty) ys ss')
-  tyAppVcode <- (C.mkTyApp (C.Ann vcode trawcode) (map C.TyVar bs))
+  let venv     = C.mkProd (zipWith (C.Ann . C.TmVar) ys ss')
+  tyAppVcode <- C.mkTyApp (C.Ann vcode trawcode) (map C.TyVar bs)
   return $
     C.Ann (C.Pack tenv (C.mkProd [tyAppVcode, venv])) t'
 
@@ -315,10 +296,6 @@ toAnnValC _ = throwError "toAnnValC: inconsistent annotation"
 --------------------------------------------
 -- C to H  (actually C)  Hoisting
 --------------------------------------------
-
-instance Monoid C.Heap where
-  mempty  = C.Heap Map.empty
-  mappend (C.Heap h1) (C.Heap h2) = C.Heap (Map.union h1 h2)
 
 -- we keep track of the current heap as we hoist
 -- 'fix' expressions out of expressions
@@ -340,7 +317,7 @@ toTmH (C.App v vs) = do
 toTmH (C.TmIf0 v tm1 tm2) = do
   liftM3 C.TmIf0 (toAnnValH v) (toTmH tm1) (toTmH tm2)
 toTmH (C.Halt ty v) =
-  liftM (C.Halt ty) (toAnnValH v)
+  C.Halt ty <$> toAnnValH v
 
 toDeclH :: C.Decl -> H C.Decl
 toDeclH (C.DeclVar x (Embed v)) = do
@@ -368,7 +345,7 @@ toAnnValH (C.Ann (C.Fix bnd1) ty) = do
   (xtys, tm)      <- unbind bnd2
   codef           <- fresh f
   tm'             <- toTmH tm
-  let v' = (C.Ann (C.Fix (bind (f,as) (bind xtys tm'))) ty)
+  let v' = C.Ann (C.Fix (bind (f,as) (bind xtys tm'))) ty
   modify (\s -> mappend s (C.Heap (Map.singleton codef v')))
   return (C.Ann (C.TmVar codef) ty)
 
@@ -388,7 +365,7 @@ toAnnValH (C.Ann (C.Pack ty1 v) ty) = do
 
 toTyA :: C.Ty -> M A.Ty
 toTyA (C.TyVar v) = return $ A.TyVar (translate v)
-toTyA C.TyInt     = return $ A.TyInt
+toTyA C.TyInt     = return A.TyInt
 toTyA (C.All bnd)   = do
   (as, tys) <- unbind bnd
   let as' = map translate as
@@ -406,7 +383,7 @@ toTyA (C.Exists bnd) = do
 toProgA :: (C.Tm, C.Heap) -> M (A.Tm, A.Heap)
 toProgA (tm, C.Heap heap) = do
   asc <- mapM (\(x,hv) -> let x' = translate x in
-                liftM (x',) (toHeapValA x' hv))
+                (x',) <$> toHeapValA x' hv)
          (Map.assocs heap)
   let heap' = A.Heap (Map.fromDistinctAscList asc)
   tm' <- toExpA tm
@@ -492,21 +469,21 @@ toAnnValA (C.Ann (C.TmProd vs) (C.TyProd tys)) = do
   (yn, ds') <- foldM (initialize tys')
                (y, concat dss' ++ [A.DeclMalloc y (Embed tys')])
                (zip [0..] vs')
-  return $ (ds', A.Ann (A.TmVar yn) (A.TyProd (map (,A.Init) tys')))
+  return (ds', A.Ann (A.TmVar yn) (A.TyProd (map (,A.Init) tys')))
 
 
 toAnnValA (C.Ann v ty) = do
   (d,v')  <- toValA v
   ty' <- toTyA ty
-  return $ (d, A.Ann v' ty')
+  return (d, A.Ann v' ty')
 
 toValA :: C.Val -> M ([A.Decl],A.Val)
-toValA (C.TmInt i) = return ([], (A.TmInt i))
+toValA (C.TmInt i) = return ([], A.TmInt i)
 toValA (C.TmVar v) = return ([], A.TmVar (translate v))
 toValA (C.TApp av ty) = do
   (ds', av') <- toAnnValA av
   ty' <- toTyA ty
-  return $ (ds', A.TApp av' ty')
+  return (ds', A.TApp av' ty')
 toValA (C.Pack ty av) = do
   ty' <- toTyA ty
   (ds', av') <- toAnnValA av
@@ -524,16 +501,16 @@ toFlag A.Un   = TAL.Un
 
 toTyTAL :: A.Ty -> M TAL.Ty
 toTyTAL (A.TyVar v) = return $ TAL.TyVar (translate v)
-toTyTAL A.TyInt     = return $ TAL.TyInt
+toTyTAL A.TyInt     = return TAL.TyInt
 toTyTAL (A.All bnd)   = do
   (as, tys) <- unbind bnd
   let as' = map translate as
   tys' <- mapM toTyTAL tys
-  let gamma = (zip [TAL.reg1 ..] tys')
+  let gamma = zip [TAL.reg1 ..] tys'
   return (TAL.All (bind as' gamma))
 toTyTAL (A.TyProd tys) = do
-  tys' <- mapM (\(ty,f) -> liftM (,toFlag f) (toTyTAL ty)) tys
-  return $ TAL.TyProd $ tys'
+  tys' <- mapM (\(ty,f) -> (,toFlag f) <$> toTyTAL ty) tys
+  return $ TAL.TyProd tys'
 toTyTAL (A.Exists bnd) = do
   (a, ty) <- unbind bnd
   let a' = translate a
@@ -548,8 +525,8 @@ type Varmap = Map A.ValName TAL.SmallVal
 -- Create a register corresponding to a particular
 -- value variable
 var2reg :: A.ValName -> M (TAL.Register, Varmap)
-var2reg x = let rd = TAL.Register ("r" ++ (name2String x) ++ show (name2Integer x)) in
-  return $ (rd,Map.singleton x (TAL.RegVal rd))
+var2reg x = let rd = TAL.Register ("r" ++ name2String x ++ show (name2Integer x)) in
+  return (rd,Map.singleton x (TAL.RegVal rd))
 
 
 toSmallVal :: Varmap -> A.Ann A.Val -> M (TAL.SmallVal, TAL.Ty)
@@ -564,12 +541,12 @@ toSmallVal vm (A.Ann (A.TApp av ty) ty1)    = do
   ty1' <- toTyTAL ty1
   ty' <- toTyTAL ty
   (sv',_) <- toSmallVal vm av
-  return $ (TAL.SApp (TAL.TyApp sv' ty'), ty1')
+  return (TAL.SApp (TAL.TyApp sv' ty'), ty1')
 toSmallVal vm (A.Ann (A.Pack ty1 av) ty2) = do
   ty1' <- toTyTAL ty1
   (av', _)  <- toSmallVal vm av
   ty2' <- toTyTAL ty2
-  return $ (TAL.SPack (TAL.Pack ty1' av' ty2'), ty2')
+  return (TAL.SPack (TAL.Pack ty1' av' ty2'), ty2')
 
 toWordVal :: Varmap -> A.Ann A.Val -> M TAL.WordVal
 toWordVal vm (A.Ann (A.TmInt i) _) = return $ TAL.TmInt i
@@ -597,8 +574,8 @@ toInstrsTAL vm delta gamma (A.Let bnd) = do
   return (heap, foldr TAL.Seq is' is)
 toInstrsTAL vm delta gamma (A.App av args) = do
   (sv, _) <- toSmallVal vm av
-  (svs,_) <- liftM unzip $ mapM (toSmallVal vm) args
-  let rtmps = map (\ (i,_) -> TAL.rtmp i) (zip [1 ..] svs)
+  (svs,_) <- unzip <$> mapM (toSmallVal vm) args
+  let rtmps = zipWith (\ i _ -> TAL.rtmp i) [1 .. ] svs
   let movs1 = zipWith TAL.Mov rtmps svs
   let movs2 = zipWith TAL.Mov [TAL.reg1 ..]
               (map TAL.RegVal rtmps)
@@ -611,10 +588,10 @@ toInstrsTAL vm delta gamma (A.TmIf0 av e1 e2) = do
   (sv,_)   <- toSmallVal vm av
   (h1,is1) <- toInstrsTAL vm delta gamma e1
   (h2,is2) <- toInstrsTAL vm delta gamma e2
-  l        <- liftM TAL.Label (fresh (string2Name "l"))
+  l        <- TAL.Label <$> fresh (string2Name "l")
   let h = Map.singleton l (TAL.Code (map translate delta) gamma is2)
   return (Map.unions [h1,h2, h],
-          (TAL.Mov (TAL.rtmp 0) sv) `TAL.Seq`
+          TAL.Mov (TAL.rtmp 0) sv `TAL.Seq`
           (TAL.Bnz (TAL.rtmp 0)
             (TAL.sapps (TAL.WordVal (TAL.LabelVal l))
                        (map TAL.TyVar delta)) `TAL.Seq`
@@ -624,15 +601,15 @@ toInstrsTAL vm delta gamma (A.Halt ty av) = do
   (sv,_)  <- toSmallVal vm av
   ty' <- toTyTAL ty
   return (Map.empty,
-          (TAL.Mov TAL.reg1 sv) `TAL.Seq`
-          (TAL.Halt ty'))
+          TAL.Mov TAL.reg1 sv `TAL.Seq`
+          TAL.Halt ty')
 
 
 toDeclTAL :: Varmap -> TAL.Delta -> TAL.Gamma -> A.Decl -> M (Varmap, TAL.Delta, TAL.Gamma, [TAL.Instruction])
 toDeclTAL vm delta gamma (A.DeclVar x (Embed av)) = do
   (sv, ty) <- toSmallVal vm av
   (rd, vm') <- var2reg x
-  return $ (Map.union vm vm',
+  return (Map.union vm vm',
             delta,
             TAL.insertGamma rd ty gamma,
             [TAL.Mov rd sv])
@@ -645,7 +622,7 @@ toDeclTAL vm delta gamma (A.DeclPrj i x (Embed av)) = do
           when (i >= length tyfs) $ throwError "Ld: index out of range"
           return $ fst (tyfs !! i)
         _ -> throwError "BUG: A.DeclPrj, not a product"
-  return $ (Map.union vm vm',
+  return (Map.union vm vm',
             delta,
             TAL.insertGamma rd ty1 gamma,
             [TAL.Mov rd sv,
@@ -659,7 +636,7 @@ toDeclTAL vm delta gamma (A.DeclPrim x (Embed (av1,p,av2))) = do
                    Plus -> TAL.Add
                    Times -> TAL.Mul
                    Minus -> TAL.Sub
-  return $ (Map.union vm vm',
+  return (Map.union vm vm',
             delta,
             TAL.insertGamma rd TAL.TyInt gamma,
             [TAL.Mov rd sv1, arith rd rd sv2])
@@ -672,7 +649,7 @@ toDeclTAL vm delta gamma (A.DeclUnpack a x (Embed av)) = do
   ty2 <- case ty1 of
               TAL.Exists bnd -> return $ patUnbind a' bnd
               _ -> throwError "BUG: Unpack, not an exists"
-  return $ (Map.union vm vm',
+  return (Map.union vm vm',
             a' : delta,
             TAL.insertGamma rd ty2 gamma,
             [TAL.Unpack a' rd sv])
@@ -680,7 +657,7 @@ toDeclTAL vm delta gamma (A.DeclUnpack a x (Embed av)) = do
 toDeclTAL vm delta gamma (A.DeclMalloc x (Embed tys)) = do
   (rd, vm') <- var2reg x
   tys' <- mapM toTyTAL tys
-  return $ (Map.union vm vm',
+  return (Map.union vm vm',
             delta,
             TAL.insertGamma rd (TAL.TyProd (map (,TAL.Un) tys')) gamma,
             [TAL.Malloc rd tys'])
@@ -695,7 +672,7 @@ toDeclTAL vm delta gamma (A.DeclAssign x (Embed (av1, i, av2))) = do
           let (before, _:after) = List.splitAt i tyfs
           return $ TAL.TyProd (before ++ [(ty2,TAL.Init)] ++ after)
         _ -> throwError "BUG: St: not a product"
-  return $ (Map.union vm vm',
+  return (Map.union vm vm',
             delta,
             TAL.insertGamma rd ty gamma,
             [TAL.Mov rd sv1,
@@ -710,7 +687,7 @@ toHeapVal vm (A.Ann (A.Code bnd)  (A.All bnd')) = do
       (xs, e) <- unbind bnd2
       tys' <- mapM toTyTAL tys
       let rs = [TAL.reg1 ..]
-      let gamma = (zip rs tys')
+      let gamma = zip rs tys'
       let vm' = Map.union vm (Map.fromList (zip xs (map TAL.RegVal rs)))
       let as' = map translate as
       (h, is) <- toInstrsTAL vm' as' gamma e
@@ -727,7 +704,7 @@ toHeapVal vm _  = throwError "wrong type for heap val"
 toProgTAL ::  (A.Tm, A.Heap) -> M TAL.Machine
 toProgTAL (tm, A.Heap hp) = do
   let vars   = Map.keys hp
-  let labels = map (\n -> TAL.Label (translate n)) vars
+  let labels = map (TAL.Label . translate) vars
   let vm     =
         Map.fromList (zip vars (map (TAL.WordVal . TAL.LabelVal) labels))
   hhvs <- mapM (toHeapVal vm) (Map.elems hp)

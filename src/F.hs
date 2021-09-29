@@ -1,21 +1,13 @@
-{-# LANGUAGE TemplateHaskell,
-             ScopedTypeVariables,
-             FlexibleInstances,
-             MultiParamTypeClasses,
-             FlexibleContexts,
-             UndecidableInstances,
-             GADTs #-}
-
 module F where
 
-import Unbound.LocallyNameless hiding (prec,empty,Data,Refl)
+import Unbound.Generics.LocallyNameless hiding (prec,empty,Data,Refl)
 
 import Control.Monad
 import Control.Monad.Trans.Except
 import qualified Data.List as List
 
 import Util
-import Text.PrettyPrint as PP
+import qualified Text.PrettyPrint as PP
 
 ------------------------------------------------------
 -- System F with type and term variables
@@ -29,7 +21,7 @@ data Ty = TyVar TyName
         | Arr Ty Ty
         | All (Bind TyName Ty)
         | TyProd [Ty]
-   deriving Show
+   deriving (Show, Generic)
 
 data Tm = TmInt Int
         | TmVar TmName
@@ -42,10 +34,9 @@ data Tm = TmInt Int
         | TLam (Bind TyName Tm)
         | TApp Tm Ty
         | Ann Tm Ty
-   deriving Show
+   deriving (Show, Generic)
 
 
-$(derive [''Ty, ''Tm])
 
 ------------------------------------------------------
 instance Alpha Ty 
@@ -114,7 +105,7 @@ sixfact = App (Fix (bind (f, n, Embed (TyInt, TyInt))
 -- /\a. \f:a. \x:a. f
 ctrue :: Tm
 ctrue = TLam (bind a 
-              (Fix (bind (y,n, Embed (TyVar a, (Arr (TyVar a) (TyVar a))))
+              (Fix (bind (y,n, Embed (TyVar a, Arr (TyVar a) (TyVar a)))
                     (Fix (bind (z, x, Embed (TyVar a, TyVar a))
                           (TmVar n))))))
 
@@ -122,7 +113,7 @@ ctrue = TLam (bind a
 -- /\a. \f:a -> a. \x:a. f (f x)
 twice = TLam (bind a 
               (Fix (bind (y,f, Embed (Arr (TyVar a) (TyVar a), 
-                                      (Arr (TyVar a) (TyVar a))))
+                                      Arr (TyVar a) (TyVar a)))
                     (Fix (bind (z, x, Embed (TyVar a, TyVar a))
                           (App (TmVar f) (App (TmVar f) (TmVar x))))))))
                            
@@ -138,7 +129,7 @@ emptyCtx = Ctx { getDelta = [], getGamma = [] }
 
 checkTyVar :: Ctx -> TyName -> M ()
 checkTyVar g v = do
-    if List.elem v (getDelta g) then
+    if v `List.elem` getDelta g then
       return ()
     else
       throwE "NotFound"
@@ -150,10 +141,10 @@ lookupTmVar g v = do
       Nothing -> throwE "NotFound"
 
 extendTy :: TyName -> Ctx -> Ctx
-extendTy n ctx = ctx { getDelta =  n : (getDelta ctx) }
+extendTy n ctx = ctx { getDelta =  n : getDelta ctx }
 
 extendTm :: TmName -> Ty -> Ctx -> Ctx
-extendTm n ty ctx = ctx { getGamma = (n, ty) : (getGamma ctx) }
+extendTm n ty ctx = ctx { getGamma = (n, ty) : getGamma ctx }
 
 -- could be replaced with fv
 tcty :: Ctx -> Ty -> M ()
@@ -166,9 +157,9 @@ tcty g  (Arr ty1 ty2) = do
    tcty g  ty1
    tcty g  ty2
 tcty g TyInt =  return ()
-tcty g (TyProd tys) = do
-   _ <- mapM (tcty g) tys
-   return ()
+tcty g (TyProd tys) =
+   mapM_ (tcty g) tys
+   
 
 typecheck :: Ctx -> Tm -> M Tm
 typecheck g e@(TmVar x) = do 
@@ -178,55 +169,71 @@ typecheck g (Fix bnd) = do
   ((f, x, Embed (ty1, ty2)), e1) <- unbind bnd
   tcty g ty1
   tcty g ty2
-  ae1@(Ann _ ty2') <- typecheck (extendTm f (Arr ty1 ty2) (extendTm x ty1 g)) e1
-  if not (ty2 `aeq` ty2')
-    then throwE $ "Type Error: Can't match " ++ pp ty2 ++ " and " ++ pp ty2'
-    else return $ Ann 
+  ae1 <- typecheck (extendTm f (Arr ty1 ty2) (extendTm x ty1 g)) e1
+  case ae1 of 
+    (Ann _ ty2') ->
+      if not (ty2 `aeq` ty2')
+      then throwE $ "Type Error: Can't match " ++ pp ty2 ++ " and " ++ pp ty2'
+      else return $ Ann 
            (Fix (bind (f,x, Embed (ty1, ty2)) ae1))
            (Arr ty1 ty2)
+    _ -> throwE "Annotated expression expected"
 typecheck g e@(App e1 e2) = do
-  ae1@(Ann _ ty1) <- typecheck g e1
-  ae2@(Ann _ ty2) <- typecheck g e2
-  case ty1 of
-    Arr ty11 ty21 | ty2 `aeq` ty11 ->
-      return (Ann (App ae1 ae2) ty21)
-    _ -> throwE "TypeError"
+  ae1 <- typecheck g e1
+  ae2 <- typecheck g e2
+  case (ae1, ae2) of 
+    (Ann _ ty1, Ann _ ty2) ->
+      case ty1 of
+        Arr ty11 ty21 | ty2 `aeq` ty11 ->
+          return (Ann (App ae1 ae2) ty21)
+        _ -> throwE "TypeError"
 typecheck g (TLam bnd) = do
   (x, e) <- unbind bnd
-  ae@(Ann _ ty) <- typecheck (extendTy x g) e
-  return $ Ann (TLam (bind x ae)) (All (bind x ty))
+  ae <- typecheck (extendTy x g) e
+  case ae of 
+    (Ann _ ty) -> 
+      return $ Ann (TLam (bind x ae)) (All (bind x ty))
 typecheck g (TApp e ty) = do
-  ae@(Ann _ tyt) <- typecheck g e
-  case tyt of
-   (All b) -> do
-      tcty g ty
-      (n1, ty1) <- unbind b
-      return $ Ann (TApp ae ty) (subst n1 ty ty1)
+  ae <- typecheck g e
+  case ae of 
+    (Ann _ tyt) -> 
+      case tyt of
+        (All b) -> do
+            tcty g ty
+            (n1, ty1) <- unbind b
+            return $ Ann (TApp ae ty) (subst n1 ty ty1)
+        _ -> throwE "TypeError"
 typecheck g (TmProd es) = do 
   atys <- mapM (typecheck g) es
   let tys = map (\(Ann _ ty) -> ty) atys
   return $ Ann (TmProd atys) (TyProd tys)
 typecheck g (TmPrj e i) = do
-  ae@(Ann _ ty) <- typecheck g e
-  case ty of 
-    TyProd tys | i < length tys -> return $ Ann (TmPrj ae i) (tys !! i)
-    _ -> throwE "TypeError"
+  ae <- typecheck g e
+  case ae of 
+    (Ann _ ty) -> 
+      case ty of 
+        TyProd tys | i < length tys -> return $ Ann (TmPrj ae i) (tys !! i)
+        _ -> throwE "TypeError"
 typecheck g (TmInt i) = return (Ann (TmInt i) TyInt)
 typecheck g (TmPrim e1 p e2) = do
-  ae1@(Ann _ ty1) <- typecheck g e1
-  ae2@(Ann _ ty2) <- typecheck g e2      
-  case (ty1 , ty2) of 
-    (TyInt, TyInt) -> return (Ann (TmPrim ae1 p ae2) TyInt)
-    _ -> throwE "TypeError"
+  ae1 <- typecheck g e1
+  ae2 <- typecheck g e2
+  case (ae1, ae2) of 
+    (Ann _ ty1, Ann _ ty2) ->      
+      case (ty1 , ty2) of 
+        (TyInt, TyInt) -> return (Ann (TmPrim ae1 p ae2) TyInt)
+        _ -> throwE "TypeError"
 typecheck g (TmIf0 e0 e1 e2) = do
-  ae0@(Ann _ ty0) <- typecheck g e0
-  ae1@(Ann _ ty1) <- typecheck g e1
-  ae2@(Ann _ ty2) <- typecheck g e2
-  if ty1 `aeq` ty2 && ty0 `aeq` TyInt then 
-    return (Ann (TmIf0 ae0 ae1 ae2) ty1)
-  else   
-    throwE "TypeError"
-
+  ae0 <- typecheck g e0
+  ae1 <- typecheck g e1
+  ae2 <- typecheck g e2
+  case (ae0, ae1, ae2) of 
+    (Ann _ ty0, Ann _ ty1, Ann _ ty2) ->
+      if ty1 `aeq` ty2 && ty0 `aeq` TyInt then 
+        return (Ann (TmIf0 ae0 ae1 ae2) ty1)
+      else   
+        throwE "TypeError"
+typecheck g _ = throwE "TypeError"
 -----------------------------------------------------------------
 -- Small-step semantics
 -----------------------------------------------------------------
@@ -269,7 +276,7 @@ step (TmProd es) = do
   es' <- steps es
   return (TmProd es')
 step (TmPrim (TmInt i1) p (TmInt i2)) = 
-  return (TmInt ((evalPrim p) i1 i2))
+  return (TmInt (evalPrim p i1 i2))
 step (TmPrim e1 p e2) | value e1 = do
   e2' <- step e2
   return (TmPrim e1 p e2')
@@ -299,7 +306,7 @@ evaluate e = if value e then return e else do
 
 instance Display Ty where
   display (TyVar n)     = display n
-  display (TyInt)       = return $ text "Int"
+  display TyInt       = return $ text "Int"
   display (Arr ty1 ty2) = do  
     d1 <- withPrec (precedence "->" + 1) $ display ty1
     d2 <- withPrec (precedence "->")     $ display ty2
@@ -307,7 +314,7 @@ instance Display Ty where
   display (All bnd) = lunbind bnd $ \ (a,ty) -> do
     da <- display a
     dt <- display ty
-    prefix "forall" (da <> text "." <+> dt)
+    prefix "forall" (da PP.<> text "." <+> dt)
   display (TyProd tys) = displayTuple tys
     
 instance Display Tm where
@@ -319,11 +326,11 @@ instance Display Tm where
     d1 <- display ty1      
     d2 <- display ty2
     de <- withPrec (precedence "fix") $ display e
-    let arg = parens (dx <> colon <> d1)
+    let arg = parens (dx PP.<> colon PP.<> d1)
     --if f `elem` (fv e :: [F.TmName])
       -- then 
-    prefix "fix" (df <+> arg <> colon <> d2 <> text "." <+> de)
-      -- else prefix "\\"  (arg <> text "." <+> de)
+    prefix "fix" (df <+> arg PP.<> colon PP.<> d2 PP.<> text "." <+> de)
+      -- else prefix "\\"  (arg PP.<> text "." <+> de)
   display (App e1 e2) = do
     d1 <- withPrec (precedence " ") $ display e1
     d2 <- withPrec (precedence " " + 1) $ display e2
@@ -332,7 +339,7 @@ instance Display Tm where
 
   display (TmPrj e i) = do
     de <- display e 
-    return $ text "Pi" <> int i <+> de
+    return $ text "Pi" PP.<> int i <+> de
   display (TmPrim e1 p e2) = do 
     let str = show p
     d1 <- withPrec (precedence str)     $ display e1 
@@ -346,7 +353,7 @@ instance Display Tm where
   display (TLam bnd) = lunbind bnd $ \(a,e) -> do
     da <- display a
     de <- withPrec (precedence "/\\") $ display e
-    prefix "/\\" (da <> text "." <+> de)
+    prefix "/\\" (da PP.<> text "." <+> de)
   display (TApp e ty) = do
     d1 <- withPrec (precedence " ") $ display e
     d2 <- withPrec (precedence " " + 1) $ display ty

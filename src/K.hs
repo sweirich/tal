@@ -1,23 +1,15 @@
-{-# LANGUAGE TemplateHaskell,
-             ScopedTypeVariables,
-             FlexibleInstances,
-             MultiParamTypeClasses,
-             FlexibleContexts,
-             UndecidableInstances,
-             GADTs #-}
-
 module K where
-
-import Unbound.LocallyNameless hiding (prec,empty,Data,Refl,Val)
 
 import Control.Monad
 import Control.Monad.Trans.Except
 import qualified Data.List as List
 
 import Util
-import Text.PrettyPrint as PP
+import Unbound.Generics.LocallyNameless hiding (prec,empty,Data,Refl,Val)
+import Unbound.Generics.LocallyNameless.Internal.Fold (toListOf)
 
-
+import qualified Text.PrettyPrint as PP
+import Data.Typeable (Typeable, cast)
 
 -- System K
 
@@ -28,30 +20,29 @@ data Ty = TyVar TyName
         | TyInt
         | All (Bind [TyName] [Ty])
         | TyProd [Ty]
-   deriving Show
+   deriving (Show, Generic)
 
 data Val = TmInt Int
         | TmVar ValName
         | Fix (Bind (ValName, [TyName]) (Bind [(ValName, Embed Ty)] Tm))
         | TmProd [AnnVal]
-   deriving Show       
+   deriving (Show, Generic)       
             
 data AnnVal = Ann Val Ty
-   deriving Show
+   deriving (Show, Generic)
             
 data Decl   = 
     DeclVar     ValName (Embed AnnVal)
   | DeclPrj Int ValName (Embed AnnVal)
   | DeclPrim    ValName (Embed (AnnVal, Prim, AnnVal))
-    deriving Show
+    deriving (Show, Generic)
              
 data Tm = Let (Bind Decl Tm)
   | App   AnnVal [Ty] [AnnVal]
   | TmIf0 AnnVal Tm Tm
   | Halt  Ty AnnVal    
-   deriving Show
+   deriving (Show, Generic)
 
-$(derive [''Ty, ''Val, ''AnnVal, ''Decl, ''Tm])
 
 ------------------------------------------------------
 instance Alpha Ty 
@@ -104,29 +95,30 @@ emptyCtx = Ctx { getDelta = [], getGamma = [] }
 
 checkTyVar :: Ctx -> TyName -> M ()
 checkTyVar g v = do
-    if List.elem v (getDelta g) then
+    if v `List.elem` getDelta g then
       return ()
     else
-      throwE $ "NotFound " ++ (show v)
+      throwE $ "NotFound " ++ show v
 
 lookupTmVar :: Ctx -> ValName -> M Ty
 lookupTmVar g v = do
     case lookup v (getGamma g) of
       Just s -> return s
-      Nothing -> throwE $ "NotFound " ++ (show v)
+      Nothing -> throwE $ "NotFound " ++ show v
 
 extendTy :: TyName -> Ctx -> Ctx
-extendTy n ctx = ctx { getDelta =  n : (getDelta ctx) }
+extendTy n ctx = ctx { getDelta =  n : getDelta ctx }
 
 extendTys :: [TyName] -> Ctx -> Ctx
 extendTys ns ctx = foldr extendTy ctx ns
 
 extendTm :: ValName -> Ty -> Ctx -> Ctx
-extendTm n ty ctx = ctx { getGamma = (n, ty) : (getGamma ctx) }
+extendTm n ty ctx = ctx { getGamma = (n, ty) : getGamma ctx }
 
 extendTms :: [ValName] -> [Ty] -> Ctx -> Ctx
 extendTms [] [] ctx = ctx
 extendTms (n:ns) (ty:tys) ctx = extendTm n ty (extendTms ns tys ctx)
+extendTms _ _ _ = error "BUG: should have same names"
 
 tcty :: Ctx -> Ty -> M ()
 tcty g  (TyVar x) =
@@ -160,7 +152,7 @@ typecheckVal g (TmInt i)   = return TyInt
 typecheckAnnVal g (Ann v ty) = do  
   tcty g ty
   ty' <- typecheckVal g v 
-  if (ty `aeq` ty') 
+  if ty `aeq` ty'
      then return ty
      else throwE "wrong anntation"
 
@@ -193,10 +185,10 @@ typecheck g (App av tys es) = do
      (as, argtys) <- unbind bnd
      let tys' = map (substs (zip as tys)) argtys
      argtys' <- mapM (typecheckAnnVal  g) es
-     if (length argtys /= length argtys') then throwE "incorrect args"
-       else if (not (all id (zipWith aeq argtys argtys'))) then 
+     if length argtys /= length argtys' then throwE "incorrect args"
+       else unless (and (zipWith aeq argtys argtys')) $
               throwE "arg mismatch"
-              else return ()
+   _ -> throwE "type error"
 typecheck g (TmIf0 av e1 e2) = do
   ty0 <- typecheckAnnVal g av
   typecheck g e1
@@ -207,9 +199,8 @@ typecheck g (TmIf0 av e1 e2) = do
     throwE "TypeError"
 typecheck g (Halt ty av) = do
   ty' <- typecheckAnnVal g av
-  if (not (ty `aeq` ty'))
-    then throwE "type error"
-    else return ()
+  unless (ty `aeq` ty') $
+    throwE "type error"
 
 
 -----------------------------------------------------------------
@@ -239,7 +230,7 @@ step (App (Ann e1@(Fix bnd) _) tys avs) = do
     (xtys, e) <- unbind bnd2
     let us = map (\(Ann u _) -> u) avs
     let xs = map fst xtys
-    return $ substs ((f,e1):(zip xs us)) (substs (zip as tys) e)
+    return $ substs ((f,e1):zip xs us) (substs (zip as tys) e)
 
 step (TmIf0 (Ann (TmInt i) _) e1 e2) = if i==0 then return e1 else return e2
 
@@ -257,21 +248,24 @@ evaluate e = do
 
 instance Display Ty where
   display (TyVar n)     = display n
-  display (TyInt)       = return $ text "Int"
+  display TyInt       = return $ text "Int"
   display (All bnd) = lunbind bnd $ \ (as,tys) -> do
     da <- displayList as
     dt <- displayList tys
     if null as 
       then return $ parens dt <+> text "-> void"
-      else prefix "forall" (brackets da <> text "." <+> parens dt <+> text "-> void")
+      else prefix "forall" (brackets da PP.<> text "." <+> parens dt <+> text "-> void")
   display (TyProd tys) = displayTuple tys
     
 instance Display (ValName,Embed Ty) where                         
   display (n, Embed ty) = do
     dn <- display n
     dt <- display ty
-    return $ dn <> colon <> dt
+    return $ dn PP.<> colon PP.<> dt
     
+
+
+
 instance Display Val where                         
   display (TmInt i) = return $ int i
   display (TmVar n) = display n
@@ -280,11 +274,11 @@ instance Display Val where
     ds    <- displayList as  
     dargs <- displayList xtys
     de    <- withPrec (precedence "fix") $ display e
-    let tyArgs = if null as then empty else brackets ds
-    let tmArgs = if null xtys then empty else parens dargs
-    if f `elem` (fv e :: [K.ValName])
-      then prefix "fix" (df <+> tyArgs <> tmArgs <> text "." $$ de)
-      else prefix "\\"  (tyArgs <> tmArgs <> text "." $$ de)
+    let tyArgs = if null as then PP.empty else brackets ds
+    let tmArgs = if null xtys then PP.empty else parens dargs
+    if f `elem` toListOf fv e
+      then prefix "fix" (df <+> tyArgs PP.<> tmArgs PP.<> text "." $$ de)
+      else prefix "\\"  (tyArgs PP.<> tmArgs PP.<> text "." $$ de)
     
   display (TmProd es) = displayTuple es
 
@@ -296,21 +290,21 @@ instance Display Tm where
     da    <- display av
     dtys  <- displayList tys
     dargs <- displayList args
-    let tyArgs = if null tys then empty else brackets dtys
-    let tmArgs = if null args then empty else parens dargs
-    return $ da <> tyArgs <+> tmArgs
+    let tyArgs = if null tys then PP.empty else brackets dtys
+    let tmArgs = if null args then PP.empty else parens dargs
+    return $ da PP.<> tyArgs <+> tmArgs
   display (Halt ty v) = do 
     dv <- display v
     return $ text "halt" <+> dv
   display (Let bnd) = lunbind bnd $ \(d, e) -> do
     dd <- display d
     de <- display e
-    return $ (text "let" <+> dd <+> text "in" $$ de)
+    return (text "let" <+> dd <+> text "in" $$ de)
   display (TmIf0 e0 e1 e2) = do
     d0 <- display e0
     d1 <- display e1
     d2 <- display e2
-    prefix "if0" $ parens $ sep [d0 <> comma , d1 <> comma, d2]
+    prefix "if0" $ parens $ sep [d0 PP.<> comma , d1 PP.<> comma, d2]
 
 instance Display Decl where
   display (DeclVar x (Embed av)) = do
@@ -320,7 +314,7 @@ instance Display Decl where
   display (DeclPrj i x (Embed av)) = do
     dx <- display x
     dv <- display av
-    return $ dx <+> text "=" <+> text "pi" <> int i <+> dv
+    return $ dx <+> text "=" <+> text "pi" PP.<> int i <+> dv
   display (DeclPrim x (Embed (e1, p, e2))) = do
     dx <- display x
     let str = show p

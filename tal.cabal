@@ -18,13 +18,46 @@ cabal-version:       >=1.10
 
 library
   exposed-modules:     A, C, Util, TAL, K, F, Translate
-  -- other-modules:
-  other-extensions:    TemplateHaskell, ScopedTypeVariables, FlexibleInstances, MultiParamTypeClasses, FlexibleContexts, UndecidableInstances, TupleSections, GADTs, TypeSynonymInstances, GeneralizedNewtypeDeriving
+  default-extensions:  ScopedTypeVariables
+    , FlexibleInstances
+    , MultiParamTypeClasses
+    , FlexibleContexts
+    , UndecidableInstances
+    , TupleSections
+    , GADTs
+    , TypeSynonymInstances
+    , DeriveGeneric
+    , TypeApplications
+    , GeneralizedNewtypeDeriving 
   build-depends:       base >=4.7 && < 5
                      , containers
                      , mtl
                      , pretty
                      , transformers
-                     , unbound
+                     , unbound-generics
   hs-source-dirs:      src
   default-language:    Haskell2010
+  
+Test-Suite test
+    type:       exitcode-stdio-1.0
+    hs-source-dirs: src
+    main-is:    Main.hs
+    other-modules: A, C, Util, TAL, K, F, Translate
+    build-depends: base
+      , containers
+      , mtl
+      , pretty
+      , transformers
+      , unbound-generics
+    default-language:    Haskell2010
+    default-extensions:  ScopedTypeVariables
+      , FlexibleInstances
+      , MultiParamTypeClasses
+      , FlexibleContexts
+      , UndecidableInstances
+      , TupleSections
+      , GADTs
+      , TypeSynonymInstances
+      , DeriveGeneric
+      , TypeApplications
+      , GeneralizedNewtypeDeriving 

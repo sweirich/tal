@@ -1,42 +1,85 @@
-{-# LANGUAGE TypeSynonymInstances,FlexibleInstances #-}
-{-# LANGUAGE TemplateHaskell, MultiParamTypeClasses #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
+module Util(
+  -- ** Local
+  patUnbind,
+  Prim(..),evalPrim,M,runM,
 
-module Util where
+  pp, Display(..), DM(..), displayList, displayTuple, intersperse, prefix, withPrec, precedence, binop,
 
-import Text.PrettyPrint as PP
+  -- * GHC.Generics
+  Generic(..),
+  
+  Set, Map,
+  -- ** PrettyPrint
+  Doc, (<+>), ($$), ($+$), int, punctuate, comma, colon, text, nest, vcat, sep, parens, braces, brackets) where
+
+import Text.PrettyPrint (Doc, (<+>), ($$), ($+$), vcat, int, punctuate, nest,
+                          comma, colon, text, sep, parens, braces, brackets, empty,
+                          render)
+import qualified Text.PrettyPrint as PP
 import Control.Applicative
 import Control.Monad.Identity
 import Control.Monad.Trans.Except
 import Control.Monad.Reader
+import Data.Set(Set)
 import qualified Data.Set as Set
 import qualified Data.List as List
+import Data.Map(Map)
+import qualified Data.Map as Map
 
-import Unbound.LocallyNameless hiding (prec,empty,Data,Refl,Val)
-import Unbound.LocallyNameless.Alpha
-import Unbound.LocallyNameless.Types
+import GHC.Generics (Generic(..))
+import Unbound.Generics.LocallyNameless hiding (prec,empty,Data,Refl,Val)
+import Unbound.Generics.LocallyNameless.Alpha
+import Unbound.Generics.LocallyNameless.Bind
+
 
 ------------------
 -- should move to Unbound.LocallyNameless.Ops
 -- ? what if the pattern binds the wrong number of variables???
+
 patUnbind :: (Alpha p, Alpha t) => p -> Bind p t -> t
-patUnbind p (B _ t) = openT p t
+patUnbind p b = case b of
+                  (B _ t) -> open initialCtx (nthPatFind p) t
 
 ------------------
+
+-- need to replace this with a better instance
+instance (Show a, Ord a, Ord b, Alpha b) => Alpha (Map a b) where
+  aeq' _ctx i j = i == j
+
+  fvAny' _ctx _nfn i = error "TAL: TODO"
+
+  close ctx b = Map.map (close ctx b)
+  open ctx b = Map.map (open ctx b)
+
+  isPat _ = mempty
+  isTerm _ = mempty
+
+  nthPatFind _ = error "TAL: Don't use a finite map as a pattern"
+  namePatFind _ = error "TAL: Don't use a finite map as a pattern"
+
+  swaps' ctx p = Map.map (swaps' ctx p)
+                          
+  freshen' _ctx i = return (i, mempty)
+  lfreshen' _ctx i cont = cont i mempty
+
+  acompare' _ctx i j = compare i j
+  
+instance (Alpha b, Subst ty b) => Subst ty (Map a b) where
+  subst n u m = Map.map (subst n u) m
+  substs ss m = Map.map (substs ss) m
 
 
 -------------------------------------------------------------------------
 -- Primitives
 -------------------------------------------------------------------------
 
-data Prim = Plus | Minus | Times deriving (Eq, Ord)
+data Prim = Plus | Minus | Times deriving (Eq, Ord, Generic)
 
 instance Show Prim where
   show Plus  = "+"
   show Minus = "-"
   show Times = "*"
 
-$(derive [''Prim])
 
 instance Alpha Prim
 
@@ -53,7 +96,7 @@ evalPrim Minus = (-)
 type M = ExceptT String FreshM
 
 runM :: M a -> a
-runM m = case (runFreshM (runExceptT m)) of
+runM m = case runFreshM (runExceptT m) of
    Left s  -> error s
    Right a -> a
 
@@ -82,12 +125,12 @@ maybeParens b d = if b then parens d else d
 prefix :: String -> Doc -> DM Doc   
 prefix str d = do
   di <- ask
-  return $ maybeParens (precedence str < prec di) (text str <+> d)
+  return $ maybeParens (precedence str < prec di) (PP.text str <+> d)
    
 binop :: Doc -> String -> Doc -> DM Doc
 binop d1 str d2 = do 
   di <- ask
-  let dop = if str == " " then sep [d1, d2] else sep [d1, text str, d2]
+  let dop = if str == " " then sep [d1, d2] else sep [d1, PP.text str, d2]
   return $ maybeParens (precedence str < prec di) dop
 
    
@@ -123,12 +166,12 @@ instance LFresh DM where
   lfresh nm = do
       let s = name2String nm
       di <- ask;
-      return $ head (filter (\x -> AnyName x `Set.notMember` (dispAvoid di))
+      return $ head (filter (\x -> AnyName x `Set.notMember` dispAvoid di)
                       (map (makeName s) [0..]))
-  getAvoids = dispAvoid <$> ask
+  getAvoids = asks dispAvoid
   avoid names = local upd where
      upd di = di { dispAvoid = 
-                      (Set.fromList names) `Set.union` (dispAvoid di) }
+                      Set.fromList names `Set.union` dispAvoid di }
 
 
 -- | An empty 'DispInfo' context
@@ -140,9 +183,8 @@ withPrec i =
   local $ \ di -> di { prec = i }
                   
 getPrec :: DM Int                  
-getPrec = do
-  di <- ask
-  return (prec di)
+getPrec = asks prec 
+  
   
   
 intersperse             :: Doc -> [Doc] -> [Doc]
@@ -153,32 +195,32 @@ intersperse sep (x:xs)  = x <> sep : intersperse sep xs
 displayList :: Display t => [t] -> DM Doc  
 displayList es = do
   ds <- mapM (withPrec 0 . display) es
-  return $ cat (intersperse comma ds)
+  return $ PP.cat (intersperse PP.comma ds)
   
 displayTuple :: Display t => [t] -> DM Doc  
 displayTuple es = do  
   ds <- displayList es
-  return $ text "<" <> ds <> text ">"  
+  return $ PP.text "<" <> ds <> PP.text ">"  
 
 --------------------------------------------
 
-instance Rep a => Display (Name a) where
-  display n = return $ (text . show) n
+instance Display (Name a) where
+  display n = return $ (PP.text . show) n
   
 --------------------------------------------
 
 instance Display String where
-  display = return . text
+  display = return . PP.text
 instance Display Int where
-  display = return . text . show
+  display = return . PP.text . show
 instance Display Integer where
-  display = return . text . show
+  display = return . PP.text . show
 instance Display Double where
-  display = return . text . show
+  display = return . PP.text . show
 instance Display Float where
-  display = return . text . show
+  display = return . PP.text . show
 instance Display Char where
-  display = return . text . show
+  display = return . PP.text . show
 instance Display Bool where
-  display = return . text . show
+  display = return . PP.text . show
 

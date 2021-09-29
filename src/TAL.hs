@@ -1,34 +1,16 @@
-{-# LANGUAGE TemplateHaskell,
-             ScopedTypeVariables,
-             FlexibleInstances,
-             MultiParamTypeClasses,
-             FlexibleContexts,
-             UndecidableInstances,
-             TupleSections,
-             GeneralizedNewtypeDeriving,
-             GADTs #-}
-
 module TAL where
 
-import Unbound.LocallyNameless hiding (prec,empty,Data,Refl,Val)
-
-import Unbound.LocallyNameless.Alpha
-import Unbound.LocallyNameless.Types
+import Util
+import Unbound.Generics.LocallyNameless hiding (prec,empty,Data,Refl,Val)
 
 import Control.Monad
 import Control.Monad.Except
 import Control.Monad.Reader
-
-
-import Data.Monoid (Monoid(..))
+import Control.Monad.Trans.Except
 
 import qualified Data.List as List
-import Data.Map (Map)
 import qualified Data.Map as Map
-
-
-import Util
-import Text.PrettyPrint as PP
+import qualified Text.PrettyPrint as PP
 
 -- Typed Assembly Language
 
@@ -39,10 +21,10 @@ data Ty = TyVar TyName
         | All (Bind [TyName] Gamma)
         | TyProd [(Ty, Flag)]  
         | Exists (Bind TyName Ty) 
-   deriving Show
+   deriving (Show, Generic)
 
 data Flag = Un | Init
-  deriving (Eq, Ord, Show)
+  deriving (Eq, Ord, Show, Generic)
 
 -- Heap types
 type Psi   = Map Label Ty  
@@ -50,7 +32,7 @@ type Psi   = Map Label Ty
 -- Register file types
 type Gamma = [(Register, Ty)]
 
-newtype Register = Register String deriving (Eq, Ord)
+newtype Register = Register String deriving (Eq, Ord, Generic)
 instance Show Register where
   show (Register s) = s
   
@@ -66,34 +48,34 @@ instance Enum Register where
   toEnum i = Register ("r" ++ show i)
   fromEnum (Register ('r' : str)) = read str
 
-newtype Label    = Label (Name Heap) deriving (Eq, Ord)
+newtype Label    = Label (Name Heap) deriving (Eq, Ord, Generic)
 instance Show Label where
   show (Label n) = show n
 
-data TyApp a = TyApp a Ty    deriving Show
+data TyApp a = TyApp a Ty    deriving (Show, Generic)
 
 sapps :: SmallVal -> [Ty] -> SmallVal 
 sapps a tys = foldr (\ ty a -> SApp (TyApp a ty)) a tys
 
-data Pack  a = Pack  Ty a Ty deriving Show
+data Pack  a = Pack  Ty a Ty deriving (Show, Generic)
 
 data WordVal = LabelVal Label
              | TmInt    Int
              | Junk     Ty  
              | WApp  (TyApp WordVal)
              | WPack (Pack  WordVal)
-   deriving Show
+   deriving (Show, Generic)
 
 data SmallVal = RegVal Register 
               | WordVal WordVal 
               | SApp  (TyApp SmallVal) 
               | SPack (Pack SmallVal)
-   deriving Show
+   deriving (Show, Generic)
             
 data HeapVal = 
     Tuple [WordVal] 
   | Code  [TyName] Gamma InstrSeq  -- nominal binding
-    deriving Show
+    deriving (Show, Generic)
 
 type Heap         = Map Label    HeapVal
 type RegisterFile = Map Register WordVal
@@ -108,13 +90,13 @@ data Instruction =
   | St  Register Int Register  
   | Sub Register Register SmallVal  
   | Unpack TyName Register SmallVal  -- binds type variable
-    deriving Show
+    deriving (Show, Generic)
              
 data InstrSeq = 
     Seq Instruction InstrSeq  -- annoying to do bind here, skipping
   | Jump SmallVal
   | Halt  Ty 
-    deriving Show
+    deriving (Show,Generic)
 
 --instance Monoid A.Heap where
 --  mempty  = A.Heap Map.empty
@@ -122,9 +104,6 @@ data InstrSeq =
 
 type Machine = (Heap, RegisterFile, InstrSeq)
 
-$(derive [''Ty, ''Flag, ''Register, ''Label, ''TyApp, ''Pack, 
-          ''WordVal, ''SmallVal, ''HeapVal, ''Instruction, 
-          ''InstrSeq])
 
 ------------------------------------------------------
 instance Alpha Flag
@@ -139,9 +118,8 @@ instance Alpha HeapVal
 instance Alpha Instruction
 instance Alpha InstrSeq
 
--- need to replace this with a better instance
-instance Alpha b => Alpha (Map Register b)
-
+  
+  
 instance Subst Ty Ty where
   isvar (TyVar x) = Just (SubstName x)
   isvar _ = Nothing
@@ -155,7 +133,7 @@ instance Subst Ty Instruction
 instance Subst Ty InstrSeq
 instance Subst Ty Label
 instance Subst Ty Register
-instance (Rep a, Subst Ty b) => Subst Ty (Map a b) 
+
 
 freshForHeap :: Heap -> Label
 freshForHeap h = Label (makeName str (i+1)) where
@@ -290,14 +268,14 @@ emptyCtx = Ctx { getDelta = [],
 
 checkTyVar :: Ctx -> TyName -> M ()
 checkTyVar g v = do
-    if List.elem v (getDelta g) then
+    if v `List.elem` getDelta g then
       return ()
     else
-      throwError $ "Type variable not found " ++ (show v)
+      throwError $ "Type variable not found " ++ show v
 
 
 extendTy :: TyName -> Ctx -> Ctx
-extendTy n ctx = ctx { getDelta =  n : (getDelta ctx) }
+extendTy n ctx = ctx { getDelta =  n : getDelta ctx }
 
 extendTys :: [TyName] -> Ctx -> Ctx
 extendTys ns ctx = foldr extendTy ctx ns
@@ -347,16 +325,23 @@ tcPsi ctx psi = mapM_ (tcty ctx) (Map.elems psi)
 tcGamma :: Ctx -> Gamma -> M ()
 tcGamma ctx g = mapM_ (tcty ctx) (map snd g)
 
+unJust :: M (Maybe a) -> M a
+unJust mma = do
+  ma <- mma
+  case ma of
+    Just x -> return x
+    Nothing -> throwE ""
+
 -- t1 is a subtype of t2
 -- D |- t1 <= t2 
 subtype :: Ctx -> Ty -> Ty -> M ()
 subtype ctx (TyVar x) (TyVar y) | x == y = return ()
 subtype ctx TyInt TyInt = return ()
 subtype ctx (All bnd1) (All bnd2) = do
-  Just (vs1, g1, vs2, g2) <- unbind2 bnd1 bnd2
+  (vs1, g1, vs2, g2) <- unJust (unbind2 bnd1 bnd2)
   subGamma ctx g1 g2
 subtype ctx  (Exists bnd1) (Exists bnd2) = do
-  Just (v1, t1, v2, t2) <- unbind2 bnd1 bnd2
+  (v1, t1, v2, t2) <- unJust (unbind2 bnd1 bnd2)
   subtype ctx t1 t2
 subtype ctx (TyProd tfs1) (TyProd tfs2) | (length tfs1 >= length tfs2) = do
   zipWithM_ (\ (t1, f1) (t2, f2) -> 
@@ -553,18 +538,18 @@ instance Display Ty where
     dt <- display g
     if null as 
       then return dt 
-      else prefix "forall" (brackets da <> text "." <+> dt)
+      else prefix "forall" (brackets da PP.<> text "." <+> dt)
   display (TyProd tys) = displayTuple tys
   display (Exists bnd) = lunbind bnd $ \ (a,ty) -> do
     da <- display a 
     dt <- display ty
-    prefix "exists" (da <> text "." <+> dt)
+    prefix "exists" (da PP.<> text "." <+> dt)
     
 instance Display (Ty, Flag) where    
   display (ty, fl) = do
     dty <- display ty
     let f = case fl of { Un -> "0" ; Init -> "1" }
-    return $ dty <> text "^" <> text f
+    return $ dty PP.<> text "^" PP.<> text f
     
 instance Display a => Display (Map Register a) where
   display m = do
@@ -588,7 +573,7 @@ instance Display a => Display (Pack a) where
   display (Pack ty e _) = do 
     dty <- display ty
     de  <- display e 
-    prefix "pack" (brackets (dty <> comma <> de))
+    prefix "pack" (brackets (dty PP.<> comma PP.<> de))
 
 instance Display a => Display (TyApp a) where
   display (TyApp av ty) = do
@@ -615,48 +600,48 @@ instance Display HeapVal where
     ds    <- displayList as  
     dargs <- display gamma
     de    <- display is
-    let tyArgs = if null as then empty else brackets ds
-    prefix "code"  (tyArgs <> dargs <> text "." $$ de)
+    let tyArgs = if null as then PP.empty else brackets ds
+    prefix "code"  (tyArgs PP.<> dargs PP.<> text "." $$ de)
     
   display (Tuple es) = displayTuple es
 
 dispArith str rd rs sv = do
   dv <- display sv
   return $ text str <+> text (show rd) 
-    <> comma <> text (show rs) <> comma <+> dv
+    PP.<> comma PP.<> text (show rs) PP.<> comma <+> dv
 
 instance Display Instruction where
   display i = case i of 
     Add rd rs sv -> dispArith "add" rd rs sv
     Bnz r sv  -> do
                  dv <- display sv
-                 return $ text "bnz" <+> text (show r) <> comma <> dv
+                 return $ text "bnz" <+> text (show r) PP.<> comma PP.<> dv
       
     (Ld  rd rs i) -> 
-      return $ text "ld" <+> text (show rd) <> comma <> text (show rs) 
-               <> brackets (int i)
+      return $ text "ld" <+> text (show rd) PP.<> comma PP.<> text (show rs) 
+               PP.<> brackets (int i)
       
     (Malloc rd tys) -> do 
       dtys <- displayList tys
-      return $ text "malloc" <+> text (show rd) <> comma <> brackets dtys
+      return $ text "malloc" <+> text (show rd) PP.<> comma PP.<> brackets dtys
       
     (Mov rd sv) -> do
       dv <- display sv
-      return $ text "mov" <+> text (show rd) <> comma <> dv
+      return $ text "mov" <+> text (show rd) PP.<> comma PP.<> dv
       
     (Mul rd rs sv) -> dispArith "mul" rd rs sv
     
     (St rd i rs) -> do
-      return $ text "st" <+> text (show rd) <> brackets (int i) <> comma 
-              <> text (show rs)
+      return $ text "st" <+> text (show rd) PP.<> brackets (int i) PP.<> comma 
+              PP.<> text (show rs)
       
     (Sub rd rs sv) -> dispArith "sub" rd rs sv
     
     (Unpack a rd sv) -> do
       dv <- display sv
       return $ text "unpack" 
-        <> brackets (text (show a) <> comma <> text (show rd))
-        <> comma <> dv
+        PP.<> brackets (text (show a) PP.<> comma PP.<> text (show rd))
+        PP.<> comma PP.<> dv
 
 instance Display InstrSeq where
   display (Seq i is) = do
