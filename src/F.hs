@@ -1,13 +1,24 @@
 module F where
 
-import Unbound.Generics.LocallyNameless hiding (prec,empty,Data,Refl)
+import Unbound.Generics.LocallyNameless
+    ( string2Name,
+      aeq,
+      bind,
+      lunbind,
+      unbind,
+      Alpha,
+      Bind,
+      Embed(..),
+      Name,
+      Subst(isvar, subst, substs),
+      SubstName(SubstName) )
 
-import Control.Monad
-import Control.Monad.Trans.Except
+import Control.Monad.Trans.Except ( throwE )
 import qualified Data.List as List
+import qualified Text.PrettyPrint as PP
 
 import Util
-import qualified Text.PrettyPrint as PP
+
 
 ------------------------------------------------------
 -- System F with type and term variables
@@ -36,9 +47,11 @@ data Tm = TmInt Int
         | Ann Tm Ty
    deriving (Show, Generic)
 
-
-
 ------------------------------------------------------
+-- Use unbound-generics to derive substitution, alpha-equivalence
+-- and free variable functions
+------------------------------------------------------
+
 instance Alpha Ty 
 instance Alpha Tm 
 
@@ -52,6 +65,11 @@ instance Subst Tm Tm where
 instance Subst Ty Ty where
   isvar (TyVar x) = Just (SubstName x)
   isvar _ = Nothing
+  
+instance Eq Ty where
+  (==) = aeq
+instance Eq Tm where
+  (==) = aeq
   
 ------------------------------------------------------
 -- Example terms
@@ -111,6 +129,7 @@ ctrue = TLam (bind a
 
 
 -- /\a. \f:a -> a. \x:a. f (f x)
+twice :: Tm
 twice = TLam (bind a 
               (Fix (bind (y,f, Embed (Arr (TyVar a) (TyVar a), 
                                       Arr (TyVar a) (TyVar a)))
@@ -125,6 +144,7 @@ type Delta = [ TyName ]
 type Gamma = [ (TmName, Ty) ]
 
 data Ctx = Ctx { getDelta :: Delta , getGamma :: Gamma }
+emptyCtx :: Ctx
 emptyCtx = Ctx { getDelta = [], getGamma = [] }
 
 checkTyVar :: Ctx -> TyName -> M ()
@@ -146,7 +166,8 @@ extendTy n ctx = ctx { getDelta =  n : getDelta ctx }
 extendTm :: TmName -> Ty -> Ctx -> Ctx
 extendTm n ty ctx = ctx { getGamma = (n, ty) : getGamma ctx }
 
--- could be replaced with fv
+-- could be replaced with a function that checks that all 
+-- free variables are contained in delta
 tcty :: Ctx -> Ty -> M ()
 tcty g  (TyVar x) =
    checkTyVar g x

@@ -20,8 +20,7 @@ operational semantics, and type checker for the languages. The file
 [Util.hs](src/Util.hs) contains definitions common to all implementations.
 
 The compiler itself is in the file [translate.hs](src/translate.hs).  To run
-the compiler, load this file into ghci and try out one of the sample programs
-from [F.hs](src/F.hs).
+the compiler, load this file into ghci and try out one of the sample programs from [F.hs](src/F.hs).
 
 In particular, you can try
 
@@ -32,3 +31,5 @@ to see the TAL output for the factorial function applied to six.
 If you would like to compile and then run this function you can try:
 
      Translate*> test F.sixfact
+
+-------------------------------------------------------------------------
