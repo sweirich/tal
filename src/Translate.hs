@@ -13,12 +13,20 @@ import qualified Data.Map as Map
 import Unbound.Generics.LocallyNameless.Internal.Fold (toListOf)
 import Unbound.Generics.PermM ( single )
 
+import Debug.Trace
+
 import Util
 import qualified F
 import qualified K
 import qualified C
 import qualified A
 import qualified TAL
+
+-- Not sure the right way to do this. But a is a Phantom type in 
+-- unbound generics
+translate :: Name a -> Name b
+translate n = makeName s i where 
+  (s,i) = (name2String n, name2Integer n)
 
 ------------------------------------
 -- The compiler pipeline, all passes
@@ -46,9 +54,6 @@ compile f = do
 
 -- type translation
 
-translate :: Name a -> Name b
-translate n = s2n (s ++ show i) where 
-  (s,i) = (name2String n, name2Integer n)
 
 toTyK :: F.Ty -> M K.Ty
 toTyK (F.TyVar n) = return $ K.TyVar (translate n)
@@ -393,7 +398,10 @@ toHeapValA :: A.ValName -> C.AnnVal -> M (A.Ann A.HeapVal)
 toHeapValA f' (C.Ann (C.Fix bnd) _) = do
   ((f,as), bnd2) <- unbind bnd
   (xtys, e)      <- unbind bnd2
-  let e' = swaps (single (AnyName f')(AnyName f)) e
+  let 
+     f1 :: C.ValName
+     f1 = translate f'
+  let e' = swaps (single (AnyName f1)(AnyName f)) e
   let (xs,tys) = unzip $ map (\(x,Embed y) -> (x,y)) xtys
   tys' <- mapM toTyA tys
   let as' = map translate as

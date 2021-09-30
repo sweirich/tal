@@ -12,23 +12,12 @@ import Control.Monad.Except ( MonadError(throwError), unless )
 
 import System.Exit (exitFailure)
 
+-- Run a few test cases that produce int values
 main :: IO ()
 main = do
-    t1
-    t2
-    t3
-    t4
-    t5
-    let wv = test F.sixfact
-    case test F.sixfact of 
-        TAL.TmInt y -> 
-            unless (y == 120) $ do
-                putStrLn $ "6! returned: " ++ pp y
-                exitFailure
-        wv -> do
-            putStrLn $ "6! returned: " ++ pp wv
-            exitFailure
-    putStrLn "6! test passed."
+    checkInt "1+1" (test F.onePlusOne) 2
+    checkInt "two" (test F.two) 2
+    checkInt "6!" (test F.sixfact) 720
 
 -------------------------------
 -- Helper functions for testing
@@ -41,8 +30,51 @@ test f = runM $ do
     Just v -> return v
     Nothing -> throwError "no result!"
 
+checkInt :: String -> TAL.WordVal -> Int -> IO ()
+checkInt name actual expected = do
+    case actual of 
+        TAL.TmInt y -> 
+            unless (y == expected) $ do
+                putStrLn $ name ++ " returned:" ++ pp y
+                exitFailure
+        wv -> do
+            putStrLn $ name ++ " returned: " ++ pp wv
+            exitFailure
+    putStrLn $ "Test passed: " ++ name
+
+
 printM :: (Display a) => M a -> IO ()
 printM x = putStrLn $ pp $ runM x
+
+printK :: F.Tm -> IO ()
+printK f = do 
+   putStrLn "--- K ---"
+   printM $ do af <- F.typecheck F.emptyCtx f
+               Translate.toProgK af
+
+printC :: F.Tm -> IO ()
+printC f = do 
+    putStrLn "--- C ---"            
+    printM $ do af <- F.typecheck F.emptyCtx f
+                k <- Translate.toProgK af
+                Translate.toProgC k
+
+printH :: F.Tm -> IO ()
+printH f = do
+    putStrLn "--- H ---"    
+    printM $ do af <- F.typecheck F.emptyCtx f
+                k <- Translate.toProgK af
+                c <- Translate.toProgC k
+                Translate.toProgH c
+
+printA :: F.Tm -> IO ()
+printA f = do 
+    putStrLn "--- A ---"    
+    printM $ do af <- F.typecheck F.emptyCtx f
+                k <- Translate.toProgK af
+                c <- Translate.toProgC k
+                h <- Translate.toProgH c
+                Translate.toProgA h
 
 t1 = do
     print "Compiling 1 + 1"

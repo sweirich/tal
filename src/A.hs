@@ -44,7 +44,7 @@ data Ann v = Ann v Ty
             
 data Decl   = 
     DeclVar     ValName (Embed (Ann Val))
-  | DeclPrj Int ValName (Embed (Ann Val))
+  | DeclPrj     Int ValName (Embed (Ann Val))
   | DeclPrim    ValName (Embed (Ann Val, Prim, Ann Val))
   | DeclUnpack  TyName ValName (Embed (Ann Val))  
   | DeclMalloc  ValName (Embed [Ty]) -- new
@@ -53,7 +53,7 @@ data Decl   =
     deriving (Show, Generic)
              
 data Tm = 
-    Let (Bind Decl Tm)
+    Let   (Bind Decl Tm)
   | App   (Ann Val) [Ann Val] 
   | TmIf0 (Ann Val) Tm Tm
   | Halt  Ty (Ann Val)    
@@ -99,6 +99,10 @@ instance Subst Val Val where
 -- Helper functions
 ------------------------------------------------------
 
+-- Tag all error messages as from this module
+throwErrorA :: MonadError String m => String -> m a
+throwErrorA s = throwError ("A:" ++ s)
+
 mkTyApp :: (MonadError String m, Fresh m) => Ann Val -> [Ty] -> m (Ann Val)
 mkTyApp av [] = return av
 mkTyApp av@(Ann _ (All bnd)) (ty:tys) = do
@@ -107,26 +111,12 @@ mkTyApp av@(Ann _ (All bnd)) (ty:tys) = do
       a:as' -> 
         let atys' = subst a ty atys in
         mkTyApp (Ann (TApp av ty) (All (bind as' atys'))) tys
-      _ -> throwError "type error: not a polymorphic All"
-mkTyApp (Ann _ ty) _ = throwError "type error: not an All"
+      _ -> throwErrorA "mkTyApp: not a polymorphic All"
+mkTyApp (Ann _ ty) _ = throwErrorA "type error: not an All"
 
 lets :: [Decl] -> Tm -> Tm
 lets [] tm = tm 
 lets (d:ds) tm = Let (bind d (lets ds tm))
-
------------------------------------------------------------------
--- Free variables, with types
------------------------------------------------------------------
-
-x :: Name Tm
-y :: Name Tm
-z :: Name Tm
-(x,y,z) = (string2Name "x", string2Name "y", string2Name "z")
-
-a :: Name Ty
-b :: Name Ty
-c :: Name Ty
-(a,b,c) = (string2Name "a", string2Name "b", string2Name "c")
 
 -----------------------------------------------------------------
 -- Typechecker
@@ -136,20 +126,23 @@ type Delta = [ TyName ]
 type Gamma = [ (ValName, Ty) ]
 
 data Ctx = Ctx { getDelta :: Delta , getGamma :: Gamma }
+  deriving Show
+  
+emptyCtx :: Ctx
 emptyCtx = Ctx { getDelta = [], getGamma = [] }
 
 checkTyVar :: Ctx -> TyName -> M ()
 checkTyVar g v = do
-    if v `List.elem` getDelta g then
-      return ()
-    else
-      throwError $ "Type variable not found " ++ show v
+    unless (v `List.elem` getDelta g) $ 
+      throwErrorA $ "Type variable not found " ++ show v ++ "\n"
+            ++ "in context: " ++ pp g
 
 lookupTmVar :: Ctx -> ValName -> M Ty
 lookupTmVar g v = do
     case lookup v (getGamma g) of
       Just s -> return s
-      Nothing -> throwError $ "Term variable notFound " ++ show v
+      Nothing -> throwErrorA $ "Term variable not found " ++ show v ++ "\n"
+        ++ "in context: " ++ pp g
 
 extendTy :: TyName -> Ctx -> Ctx
 extendTy n ctx = ctx { getDelta =  n : getDelta ctx }
@@ -164,14 +157,6 @@ extendTms :: [ValName] -> [Ty] -> Ctx -> Ctx
 extendTms [] [] ctx = ctx
 extendTms (n:ns) (ty:tys) ctx = extendTm n ty (extendTms ns tys ctx)
 extendTms _ _ _ = error "wrong number"
-{-
-extendDecl :: Decl -> Ctx -> Ctx
-extendDecl (DeclVar x (Embed (Ann _ ty))) = extendTm x ty
-extendDecl (DeclPrj i x (Embed (Ann _ (TyProd tys)))) = extendTm x (tys !! i)                                           
-extendDecl (DeclPrim x  _) = extendTm x TyInt
-extendDecl (DeclUnpack b x (Embed (Ann _ (Exists bnd)))) = 
-  extendTy b . extendTm x (patUnbind b bnd)
--}
 
 
 tcty :: Ctx -> Ty -> M ()
@@ -179,7 +164,7 @@ tcty g  (TyVar x) =
    checkTyVar g x
 tcty g  (All b) = do
    (xs, tys) <- unbind b
-   let g' = extendTys xs g -- XX
+   let g' = extendTys xs g
    mapM_ (tcty g') tys
 tcty g TyInt =  return ()
 tcty g (TyProd tys) = do
@@ -199,16 +184,16 @@ typecheckHeapVal g (Ann (Code bnd) (All bnd')) = do
       mapM_ (tcty g') tys
       typecheck (extendTms xs tys g') e
       return (All bnd')
-    Nothing -> throwError "wrong # of type variables"
+    Nothing -> throwErrorA "wrong # of type variables"
 typecheckHeapVal g (Ann (Code bnd) _ ) = 
-    throwError "code must have forall type"
+    throwErrorA "code must have forall type"
   
 typecheckHeapVal g (Ann (Tuple es) ty) = do 
   tys <- mapM (typecheckAnnVal g) es
   let ty' = TyProd $ map (,Un) tys 
   if ty `aeq` ty' 
     then return ty
-    else throwError "incorrect annotation on tuple"
+    else throwErrorA "incorrect annotation on tuple"
 
 typecheckVal :: Ctx -> Val -> M Ty
 typecheckVal g (TmVar x) = lookupTmVar g x
@@ -220,13 +205,14 @@ typecheckVal g (TApp av ty) = do
     All bnd -> do 
       (as, bs) <- unbind bnd
       case as of 
-        [] -> throwError "can't instantiate non-polymorphic function"
+        [] -> throwErrorA "can't instantiate non-polymorphic function"
         (a:as') -> do
           let bs' = subst a ty bs
           return (All (bind as' bs'))
-    _ -> throwError "type error"
-typecheckVal g (Pack _ _) = throwError "pack must be annotated"
+    _ -> throwErrorA "type error"
+typecheckVal g (Pack _ _) = throwErrorA "pack must be annotated"
 
+typecheckAnnVal :: Ctx -> Ann Val -> M Ty
 typecheckAnnVal g (Ann (Pack ty1 av) ty) = do
   case ty of 
     Exists bnd -> do 
@@ -234,16 +220,17 @@ typecheckAnnVal g (Ann (Pack ty1 av) ty) = do
       tcty g ty1
       ty' <- typecheckAnnVal g av
       if not (ty' `aeq` subst a ty1 ty2)
-         then throwError "type error"
+         then throwErrorA "type error"
          else return ty 
-    _ -> throwError "must be exists for pack"    
+    _ -> throwErrorA "must be exists for pack"    
 typecheckAnnVal g (Ann v ty) = do  
   tcty g ty
   ty' <- typecheckVal g v 
   if ty `aeq` ty'
      then return ty
-     else throwError $ "wrong annotation on: " ++ pp v ++ "\nInferred: " ++ pp ty' ++ "\nAnnotated: " ++ pp ty 
+     else throwErrorA $ "wrong annotation on: " ++ pp v ++ "\nInferred: " ++ pp ty' ++ "\nAnnotated: " ++ pp ty 
 
+typecheckDecl :: Ctx -> Decl -> M Ctx
 typecheckDecl g (DeclVar x (Embed av)) = do
   ty <- typecheckAnnVal g av
   return $ extendTm x ty g
@@ -252,20 +239,20 @@ typecheckDecl g (DeclPrj i x (Embed av@(Ann v _))) = do
   case ty of 
     TyProd tys | i < length tys -> 
       return $ extendTm x (fst (tys !! i)) g
-    _ -> throwError "cannot project"
+    _ -> throwErrorA "cannot project"
 typecheckDecl g (DeclPrim x (Embed (av1, _, av2))) = do
   ty1 <- typecheckAnnVal g av1
   ty2 <- typecheckAnnVal g av2
   case (ty1 , ty2) of 
     (TyInt, TyInt) -> return $ extendTm x TyInt g
-    _ -> throwError "TypeError"
+    _ -> throwErrorA "TypeError"
 typecheckDecl g (DeclUnpack a x (Embed av)) = do
   tya <- typecheckAnnVal g av
   case tya of 
     Exists bnd -> do 
       let ty = patUnbind a bnd 
       return $ extendTy a (extendTm x ty g)
-    _ -> throwError "TypeError"
+    _ -> throwErrorA "TypeError"
 typecheckDecl g (DeclMalloc x (Embed tys)) = do                
   mapM_ (tcty g) tys
   return $ extendTm x (TyProd (map (,Un) tys)) g      
@@ -277,8 +264,8 @@ typecheckDecl g (DeclAssign x (Embed (av1@(Ann v1 _), i, av2))) = do
       let (xs,(ty,_):ys) = splitAt i tys in
       if ty `aeq` ty2 
         then return $ extendTm x (TyProd (xs ++ (ty,Init) : ys)) g
-        else throwError "TypeError"
-    _ -> throwError "TypeError"
+        else throwErrorA "TypeError"
+    _ -> throwErrorA "TypeError"
          
 typecheck :: Ctx -> Tm -> M ()
 typecheck g (Let bnd) = do
@@ -292,13 +279,13 @@ typecheck g (App av es) = do
      (as, argtys) <- unbind bnd
      argtys' <- mapM (typecheckAnnVal g) es
      if not (null as)  
-       then throwError "must use type application"
+       then throwErrorA "must use type application"
        else 
          if length argtys /= length argtys'
-           then throwError "incorrect args"
+           then throwErrorA "incorrect args"
            else unless (and (zipWith aeq argtys argtys')) $ 
-              throwError "arg mismatch"
-   _ -> throwError "need forall type"
+              throwErrorA "arg mismatch"
+   _ -> throwErrorA "need forall type"
 typecheck g (TmIf0 av e1 e2) = do
   ty0 <- typecheckAnnVal g av
   typecheck g e1
@@ -306,14 +293,15 @@ typecheck g (TmIf0 av e1 e2) = do
   if ty0 `aeq` TyInt then 
     return ()
   else   
-    throwError "TypeError"
+    throwErrorA "TypeError"
 typecheck g (Halt ty av) = do
   ty' <- typecheckAnnVal g av
   unless (ty `aeq` ty') $
-    throwError "type error"
+    throwErrorA "type error"
 
          
          
+progcheck :: (Tm, Heap) -> M ()
 progcheck (tm, Heap m) = do
   let g = 
         Map.foldlWithKey (\ctx x (Ann _ ty) -> extendTm x ty ctx) 
@@ -338,9 +326,9 @@ mkSubst (DeclPrim  x (Embed (Ann (TmInt i1) _, p, Ann (TmInt i2) _))) =
 mkSubst (DeclUnpack a x (Embed (Ann (Pack ty (Ann u _)) _))) = 
   return $ subst a ty . subst x u  
 mkSubst (DeclPrj i x (Embed av)) = 
-  throwError $ "invalid prj " ++ pp i ++ ": " ++ pp av
+  throwErrorA $ "invalid prj " ++ pp i ++ ": " ++ pp av
 mkSubst (DeclUnpack a x (Embed av)) = 
-  throwError $ "invalid unpack:" ++ pp av
+  throwErrorA $ "invalid unpack:" ++ pp av
 
 
 
@@ -360,7 +348,7 @@ step (App (Ann e1@(Fix bnd) _) avs) = do
 
 step (TmIf0 (Ann (TmInt i) _) e1 e2) = if i==0 then return e1 else return e2
 
-step _ = throwError "cannot step"
+step _ = throwErrorA "cannot step"
   
 evaluate :: Tm -> M Val
 evaluate (Halt _ (Ann v _)) = return v
@@ -424,10 +412,6 @@ instance Display HeapVal where
   
 
 instance Display a => Display (Ann a) where
-{-  display (Ann av ty) = do
-    da <- display av
-    dt <- display ty
-    return $ parens (da PP.<> text ":" PP.<> dt)  -}
   display (Ann av _) = display av
 
 instance Display Tm where
@@ -495,3 +479,15 @@ instance Display (Tm, Heap) where
     dh <- display h
     dt <- display tm
     return $ dh $$ text "in" <+> dt
+
+instance Display (ValName, Ty) where
+  display (v, ty) = do
+    dt <- display ty
+    return $ text (show v) <+> colon <+> dt
+
+instance Display Ctx where
+  display (Ctx delta gamma) = do
+    tyvars <- mapM display delta
+    tmvars <- mapM display gamma
+    return $ vcat [text "delta:" <+> hsep tyvars,
+                   text "gamma:" <+> sep tmvars ]
